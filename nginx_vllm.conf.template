@@ -1,0 +1,56 @@
+worker_processes auto;
+error_log {{NGINX_ERROR_LOG}} warn;
+pid {{NGINX_PID}};
+
+events {
+    worker_connections 4096;
+    multi_accept on;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    log_format vllm_format '$remote_addr [$time_local] "$request" '
+                           '$status $upstream_addr $request_time $upstream_response_time';
+
+    upstream vllm_backend {
+        # ✅ 一致性哈希解决keepalive流量倾斜 (Nginx ≥1.19.8)
+        hash $request_id consistent;
+
+{{UPSTREAM_SERVERS}}
+
+        keepalive 128;
+        keepalive_requests 10000;
+        keepalive_timeout 60s;
+    }
+
+    server {
+        listen {{LISTEN_PORT}} reuseport;
+        server_name localhost;
+        access_log {{NGINX_ACCESS_LOG}} vllm_format buffer=32k flush=5s;
+
+        location / {
+            proxy_pass http://vllm_backend;
+
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_buffering off;
+            proxy_request_buffering off;
+            chunked_transfer_encoding on;
+            tcp_nodelay on;
+
+            proxy_next_upstream error timeout invalid_header http_503;
+            proxy_next_upstream_tries 2;
+            proxy_next_upstream_timeout 30s;
+
+            proxy_read_timeout 1800s;
+            proxy_send_timeout 1800s;
+            proxy_connect_timeout 30s;
+
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+    }
+}
