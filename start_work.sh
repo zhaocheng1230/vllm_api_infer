@@ -154,113 +154,74 @@ cmd_start() {
     echo "检测到 ${#started_ports[@]} 个 vLLM 实例端口: ${started_ports[*]}"
 }
 
-# ========================== nginx 命令 ==========================
+# ========================== NGINX 配置生成（负载均衡修复版） ==========================
+do_nginx() {
+    local listen_port="${2:-1358}"
+    local template_file="$(dirname "$0")/nginx_vllm.conf.template"
+    local nginx_conf="/tmp/nginx_vllm.conf"
+    local nginx_pid="/tmp/nginx_vllm.pid"
+    local nginx_error_log="/tmp/nginx_vllm_error.log"
+    local nginx_access_log="/tmp/nginx_vllm_access.log"
 
-cmd_nginx() {
-    local listen_port="${1:-1358}"
-    local nginx_conf="/etc/nginx/nginx.conf"
-    local nginx_error_log="${SCRIPT_DIR}/start_log/nginx/error.log"
-    local nginx_access_log="${SCRIPT_DIR}/start_log/nginx/access.log"
-    local nginx_pid="${SCRIPT_DIR}/start_log/nginx/nginx.pid"
-
-    mkdir -p "$(dirname "$nginx_error_log")"
-
-    # 从 PID 文件或运行中的进程获取 vLLM 端口
-    local ports=()
-    if [ -f "$PID_FILE" ]; then
-        while read -r pid; do
-            local p
-            p=$(ps -p "$pid" -o args= 2>/dev/null | grep -oP '(?<=--port )\d+' || true)
-            [ -n "$p" ] && ports+=("$p")
-        done < "$PID_FILE"
+    # 检查模板是否存在
+    if [ ! -f "$template_file" ]; then
+        echo "[ERROR] 模板文件不存在: ${template_file}"
+        exit 1
     fi
 
-    # 去重并排序
-    IFS=$'\n' ports=($(printf '%s\n' "${ports[@]}" | sort -un)); unset IFS
+    # 动态检测 vLLM 端口
+    local ports
+    ports=$(ss -tlnp 2>/dev/null | grep '"vllm"' | grep -oP '(?<=0\.0\.0\.0:)\d+' | sort -n)
+    if [ -z "$ports" ]; then
+        echo "[ERROR] 未检测到任何 vllm 监听端口，请先执行 start"
+        exit 1
+    fi
 
-    [ ${#ports[@]} -eq 0 ] && { log_err "未找到运行中的 vLLM 实例"; exit 1; }
+    local port_count=$(echo "$ports" | wc -l)
+    echo "检测到 ${port_count} 个 vLLM 实例端口: $(echo $ports | tr '\n' ' ')"
 
-    local port_count=${#ports[@]}
+    # 生成 upstream server 块
     local upstream_servers=""
-    for p in "${ports[@]}"; do
-        upstream_servers+="        server 127.0.0.1:${p};\n"
+    for port in $ports; do
+        upstream_servers="${upstream_servers}        server 127.0.0.1:${port} max_fails=3 fail_timeout=30s;"$'\n'
     done
 
-    cat > "$nginx_conf" << NGINX_EOF
-worker_processes  auto;
-error_log  ${nginx_error_log} warn;
-pid        ${nginx_pid};
+    # ✅ 用 sed 替换占位符（| 作分隔符，避免路径冲突）
+    sed -e "s|{{NGINX_ERROR_LOG}}|${nginx_error_log}|g" \
+        -e "s|{{NGINX_PID}}|${nginx_pid}|g" \
+        -e "s|{{NGINX_ACCESS_LOG}}|${nginx_access_log}|g" \
+        -e "s|{{LISTEN_PORT}}|${listen_port}|g" \
+        "$template_file" > "$nginx_conf"
 
-events {
-    worker_connections  4096;
-}
+    # ✅ 单独替换多行 upstream 块（用临时文件避免 sed 多行插入问题）
+    local tmp_conf=$(mktemp)
+    awk -v servers="$upstream_servers" '
+        /\{\{UPSTREAM_SERVERS\}\}/ { printf "%s", servers; next }
+        { print }
+    ' "$nginx_conf" > "$tmp_conf" && mv "$tmp_conf" "$nginx_conf"
 
-http {
-    include       mime.types;
-    default_type  application/octet-stream;
-    log_format vllm_format '\$remote_addr - [\$time_local] "\$request" '
-                           'status:\$status upstream:\$upstream_addr '
-                           'rt:\$request_time urt:\$upstream_response_time';
+    echo "已生成 ${nginx_conf} (监听端口: ${listen_port}, 后端实例: ${port_count})"
 
-    client_max_body_size 100m;
-
-    upstream vllm_backend {
-        least_conn;
-
-$(echo -e "$upstream_servers")
-        keepalive 32;
-    }
-
-    server {
-        listen ${listen_port};
-        server_name localhost;
-        access_log ${nginx_access_log} vllm_format;
-
-        location / {
-            proxy_pass http://vllm_backend;
-            proxy_next_upstream error timeout invalid_header http_504 http_429;
-            proxy_next_upstream_tries ${port_count};
-            proxy_next_upstream_timeout 120s;
-
-            # 流式输出支持
-            proxy_http_version 1.1;
-            proxy_set_header Connection "";
-            proxy_buffering off;
-            proxy_request_buffering off;
-
-            # 超时控制
-            proxy_read_timeout 1800s;
-            proxy_send_timeout 1800s;
-            proxy_connect_timeout 300s;
-
-            # SSE/流式响应必需
-            proxy_set_header Cache-Control "no-cache";
-            chunked_transfer_encoding on;
-
-            proxy_set_header Host \$host;
-            proxy_set_header X-Real-IP \$remote_addr;
-            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        }
-    }
-}
-NGINX_EOF
-
-    nginx -t -c "$nginx_conf" 2>&1 || { log_err "Nginx 配置校验失败"; exit 1; }
-
-    # 停止旧 nginx（如果有）
-    if [ -f "$nginx_pid" ]; then
-        local old_pid
-        old_pid=$(cat "$nginx_pid" 2>/dev/null || true)
-        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-            nginx -s reload -c "$nginx_conf" 2>/dev/null && { log_ok "Nginx 已重载"; return 0; }
-            kill "$old_pid" 2>/dev/null || true
-            sleep 1
-        fi
+    # 停止旧进程 → 验证 → 启动/重载（逻辑不变）
+    if [ -f "$nginx_pid" ] && kill -0 "$(cat "$nginx_pid" 2>/dev/null)" 2>/dev/null; then
+        echo "停止旧的 nginx 进程..."
+        nginx -s stop -c "${nginx_conf}" 2>/dev/null || true
+        sleep 1
     fi
 
-    nginx -c "$nginx_conf"
-    log_ok "Nginx 已启动"
-    echo "统一访问入口: http://localhost:${listen_port}"
+    if nginx -t -c "${nginx_conf}" 2>&1; then
+        if [ -f "$nginx_pid" ] && kill -0 "$(cat "$nginx_pid" 2>/dev/null)" 2>/dev/null; then
+            nginx -s reload -c "${nginx_conf}"
+            echo "[OK] Nginx 已重载"
+        else
+            nginx -c "${nginx_conf}"
+            echo "[OK] Nginx 已启动"
+        fi
+        echo "统一访问入口: http://localhost:${listen_port}"
+    else
+        echo "[ERROR] Nginx 配置验证失败，请检查 ${nginx_conf}"
+        exit 1
+    fi
 }
 
 # ========================== status 命令 ==========================
