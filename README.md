@@ -1,122 +1,277 @@
-# vLLM 多实例启动 + Nginx 负载均衡管理脚本
+# vLLM 多实例推理框架（Ascend NPU / NVIDIA GPU + Nginx）
 
-本项目提供一套在 **昇腾 NPU**（Ascend）环境下批量启动多个 vLLM 推理实例，并通过 Nginx 反向代理统一对外提供服务的管理脚本。
+本项目面向 **昇腾 NPU 或 NVIDIA GPU** 环境，启动时会自动识别设备后端，并提供一套完整的批量推理流水线：
+
+- 自动启动多个 vLLM 实例，并通过 Nginx 统一对外提供 OpenAI 兼容接口
+- 异步流式调用接口，高并发处理 `datasets/` 目录下的所有 `.jsonl` 文件
+- 为每条数据的 `prompt` 生成 `output`，结果写入 `output/` 目录
+
+默认输入目录为 `datasets/`，默认输出目录为 `output/`。
 
 ## 项目结构
 
 ```
 .
-├── start_work.sh                # 主管理脚本（start / nginx / status / stop）
-├── "start_work copy.sh"         # 旧版脚本备份（基于模板文件生成 Nginx 配置）
-└── nginx_vllm.conf.template     # Nginx 配置模板（一致性哈希负载均衡版）
+├── start_server.sh              # 服务端管理：启动 vLLM 多实例 + Nginx
+├── vllm_infer.py                # 客户端：异步流式批量推理
+├── run_pipeline.sh              # 任务入口：启动服务 + 执行推理
+├── nginx_vllm.conf.template     # Nginx 配置模板
+├── .gitignore                   # 忽略运行时产物
+├── datasets/                    # 输入目录（*.jsonl）
+├── output/                      # 输出目录
+└── logs/                        # vLLM 实例日志（运行后生成）
 ```
-
-## 功能特性
-
-- **自动检测 NPU 数量**：通过 `npu-smi info -l` 获取 NPU 总数，按每实例卡数自动计算并启动相应数量的 vLLM 实例
-- **NPU 分组隔离**：每个实例通过 `ASCEND_RT_VISIBLE_DEVICES` 绑定独立的 NPU 卡组，端口从 `VLLM_BASE_PORT`（默认 8000）起依次分配
-- **模型自适应参数**：根据模型名称动态选择 tool-call parser 与额外参数
-  - `Qwen3.5+`：启用 `--language-model-only` + `qwen3_coder` parser
-  - `MiniCPM5`：使用 `minicpm5` parser + tool-parser-plugin
-  - 其他模型：默认 `hermes` parser
-- **健康检查**：启动后轮询各实例 `/health` 接口（超时 300s），汇报就绪情况
-- **Nginx 负载均衡**：自动生成 Nginx 配置，`least_conn` 策略 + keepalive 长连接，支持 SSE 流式输出、故障转移（`proxy_next_upstream`）、1800s 长超时
-- **统一管理**：一键查看状态、停止全部 vLLM 实例与 Nginx
 
 ## 环境要求
 
 - Linux + Bash（脚本使用 `set -euo pipefail`）
-- [vLLM](https://docs.vllm.ai/)（昇腾适配版，含 `vllm` CLI）
-- Ascend NPU 及 `npu-smi` 工具链
-- Nginx ≥ 1.19.8（如需使用模板中的一致性哈希）
+- vLLM（NPU 使用昇腾适配版；GPU 使用官方 GPU 版）
+- NPU：Ascend NPU + `npu-smi`
+- GPU：NVIDIA GPU + `nvidia-smi`
+- Nginx ≥ 1.19.8（一致哈希需要）
+- Python 依赖：`openai`、`httpx`、`tqdm`（可选）
 - 常用工具：`ss` / `netstat`、`curl`、`ps`
 
 ## 快速开始
 
-```bash
-# 1. 启动多个 vLLM 实例（自动铺满所有 NPU）
-bash start_work.sh start /path/to/model MyModel 2 131072
+### 1. 准备输入数据
 
-# 2. 生成并启动 Nginx 反向代理（默认监听 1358 端口）
-bash start_work.sh nginx
+把需要推理的 `.jsonl` 文件放入 `datasets/`。每行一个 JSON，至少包含 `prompt` 字段：
 
-# 3. 查看运行状态
-bash start_work.sh status
-
-# 4. 停止所有服务（vLLM + Nginx）
-bash start_work.sh stop
+```json
+{"prompt": "请解释什么是张量并行"}
+{"prompt": "写一个快速排序的 Python 实现"}
 ```
 
-## 命令说明
+也支持直接传入 messages 列表：
 
-| 命令 | 语法 | 说明 |
+```json
+{"prompt": [{"role": "user", "content": "你好"}]}
+```
+
+客户端依次识别以下字段作为 prompt：`prompt`、`input`、`question`、`query`、`content`、`messages`。
+
+### 2. 配置模型并启动任务
+
+```bash
+export MODEL_PATH=/path/to/model
+export MODEL_NAME=MyModel
+export TP_SIZE=8
+
+bash run_pipeline.sh
+```
+
+`run_pipeline.sh` 会自动完成：
+
+1. 检查 Nginx 端口上的服务是否已运行
+2. 若未运行，调用 `start_server.sh start` 启动 vLLM 多实例
+3. 调用 `start_server.sh nginx` 启动 Nginx 反向代理
+4. 等待 `/v1/models` 就绪
+5. 调用 `vllm_infer.py` 处理 `datasets/` 下所有 jsonl
+6. 结果写入 `output/`
+
+### 3. 指定目录和端口
+
+```bash
+bash run_pipeline.sh ./datasets ./output 1358
+```
+
+## 设备后端自动识别
+
+`start_server.sh` 同时支持 Ascend NPU 与 NVIDIA GPU：
+
+| 后端 | 检测方式 | 可见设备变量 |
 | --- | --- | --- |
-| `start` | `bash start_work.sh start <model_path> <model_name> <tp_size> [max_model_len]` | 按 NPU 总数 / 每模型卡数计算实例数量，逐个后台启动 vLLM，并进行健康检查。`max_model_len` 默认 `131072` |
-| `nginx` | `bash start_work.sh nginx [listen_port]` | 从 PID 文件收集运行中的 vLLM 端口，生成 `/etc/nginx/nginx.conf`，校验后启动或重载 Nginx。`listen_port` 默认 `1358` |
-| `status` | `bash start_work.sh status` | 显示各 vLLM 进程（PID / 端口）存活情况及 Nginx 运行状态 |
-| `stop` | `bash start_work.sh stop` | 停止所有 vLLM 实例与 Nginx，并清理 PID 文件 |
+| NPU | `npu-smi info -l` 中出现 `NPU ID` | `ASCEND_RT_VISIBLE_DEVICES` |
+| GPU | `nvidia-smi -L` 中出现 `GPU N` | `CUDA_VISIBLE_DEVICES` |
 
-## 环境变量
+默认 `DEVICE_BACKEND=auto`。如果机器上同时存在 NPU 和 GPU，或自动识别失败，可手动指定：
+
+```bash
+export DEVICE_BACKEND=npu   # 或 gpu
+```
+
+脚本会优先复用已有的 `CUDA_VISIBLE_DEVICES` / `ASCEND_RT_VISIBLE_DEVICES`。也可以进一步限制设备数量（例如设备工具不可用，或只想使用部分卡）：
+
+```bash
+export DEVICE_COUNT=8
+```
+
+GPU 默认参数：
+
+- 显存利用率：`0.90`，可通过 `VLLM_GPU_MEM_UTIL` 覆盖
+- dtype：`auto`，可通过 `VLLM_DTYPE` 覆盖
+- 其余 TP 档位参数与 NPU 相同
+
+NPU 默认参数：
+
+- 显存利用率按 TP 档位取值（见下表）
+- dtype：`bfloat16`
+
+## 常用命令
+
+### 服务端管理
+
+```bash
+# 启动 vLLM 实例（按设备总数 / tp_size 自动计算实例数）
+bash start_server.sh start <model_path> <model_name> <tp_size> [max_model_len]
+
+# 启动/重载 Nginx（默认监听 1358）
+bash start_server.sh nginx [listen_port]
+
+# 查看 vLLM 与 Nginx 状态
+bash start_server.sh status
+
+# 停止所有 vLLM 实例与 Nginx
+bash start_server.sh stop
+```
+
+### 客户端推理
+
+```bash
+# 使用默认 datasets/ 和 output/
+python vllm_infer.py --model MyModel
+
+# 完整参数示例
+python vllm_infer.py \
+    --input_dir ./datasets \
+    --output_dir ./output \
+    --host http://localhost:1358/v1 \
+    --model MyModel \
+    --concurrency 128 \
+    --max_tokens 4096
+```
+
+## `run_pipeline.sh` 环境变量
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `VLLM_BASE_PORT` | `8000` | vLLM 实例起始端口，后续实例依次 +1 |
-| `MINICPM5_PLUGIN` | `/path/to/MiniCPM/tool_parsers/minicpm5xml_tool_parser.py` | MiniCPM5 模型的 tool-parser-plugin 路径 |
+| `MODEL_PATH` | 必填 | 模型路径 |
+| `MODEL_NAME` | 必填 | 模型名，需与 `--served-model-name` 一致 |
+| `TP_SIZE` | `2` | 每个实例使用的 NPU 卡数 |
+| `MAX_MODEL_LEN` | `131072` | 最大模型长度 |
+| `VLLM_BASE_PORT` | `8000` | vLLM 实例起始端口 |
+| `NGINX_PORT` | `1358` | Nginx 监听端口 |
+| `CONCURRENCY` | `64` | 推理并发数 |
+| `STOP_AFTER` | `0` | 推理结束后是否停止服务（`1` 为停止） |
+| `PYTHON` | `python` | Python 解释器命令 |
+| `DEVICE_BACKEND` | `auto` | 设备后端：`auto` / `npu` / `gpu` |
+| `DEVICE_COUNT` | 自动检测 | 覆盖设备数量 |
+| `VLLM_GPU_MEM_UTIL` | `0.90` | GPU 显存利用率 |
+| `VLLM_DTYPE` | GPU 为 `auto`，NPU 为 `bfloat16` | 覆盖 dtype |
 
-## vLLM 关键启动参数
-
-脚本为每个实例使用以下核心参数（可按需修改 `cmd_start`）：
-
-```bash
-vllm serve <model_path> \
-    --host 0.0.0.0 --port <port> \
-    --served-model-name <model_name> \
-    --tensor-parallel-size <tp_size> \
-    --gpu-memory-utilization 0.85 \
-    --dtype auto \
-    --max-model-len <max_model_len> \
-    --trust-remote-code \
-    --enable-prefix-caching \
-    --enable-auto-tool-choice \
-    --tool-call-parser <parser>
-```
-
-## Nginx 配置说明
-
-### 运行时生成版（`start_work.sh nginx`）
-
-- 负载均衡：`least_conn`，upstream 自动填入检测到的所有 vLLM 端口
-- 长连接：`keepalive 32`
-- 流式支持：`proxy_buffering off`、`proxy_http_version 1.1`、清空 `Connection` 头、`Cache-Control: no-cache`
-- 容错：`proxy_next_upstream error timeout invalid_header http_504 http_429`，重试次数等于实例数
-- 超时：读/写 1800s，连接 300s；`client_max_body_size 100m`
-- 日志：`start_log/nginx/access.log`、`error.log`（自定义 `vllm_format` 记录 upstream 与耗时）
-
-### 模板版（`nginx_vllm.conf.template`）
-
-占位符：`{{NGINX_ERROR_LOG}}`、`{{NGINX_PID}}`、`{{UPSTREAM_SERVERS}}`、`{{LISTEN_PORT}}`、`{{NGINX_ACCESS_LOG}}`。
-
-特点：采用 `hash $request_id consistent` **一致性哈希**解决 keepalive 场景下的流量倾斜问题（需 Nginx ≥ 1.19.8），`keepalive 128` / `keepalive_requests 10000`，并开启 `reuseport`。可通过 `envsubst` 等工具渲染后使用，例如：
+示例：
 
 ```bash
-sed -e "s|{{LISTEN_PORT}}|1358|g" \
-    -e "s|{{NGINX_ACCESS_LOG}}|/var/log/nginx/vllm_access.log|g" \
-    -e "s|{{NGINX_ERROR_LOG}}|/var/log/nginx/vllm_error.log|g" \
-    -e "s|{{NGINX_PID}}|/tmp/nginx_vllm.pid|g" \
-    -e "s|{{UPSTREAM_SERVERS}}|server 127.0.0.1:8000;\n server 127.0.0.1:8001;|g" \
-    nginx_vllm.conf.template > /tmp/nginx_vllm.conf
-nginx -c /tmp/nginx_vllm.conf
+export MODEL_PATH=/data/models/Qwen3-235B-A22B
+export MODEL_NAME=Qwen3-235B-A22B
+export TP_SIZE=8
+export CONCURRENCY=128
+export STOP_AFTER=1
+
+bash run_pipeline.sh
 ```
 
-## 产物与日志
+## `vllm_infer.py` 主要参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--input_dir` | `<项目>/datasets` | 输入 jsonl 目录 |
+| `--output_dir` | `<项目>/output` | 输出目录 |
+| `--host` | `http://localhost:1358/v1` | OpenAI 兼容接口 base_url |
+| `--model` | 必填 | 模型名 |
+| `--key` | `EMPTY` | API Key |
+| `--concurrency` | `64` | 并发请求数 |
+| `--max_tokens` | `4096` | 最大生成 token 数 |
+| `--temperature` | `0.0` | 采样温度 |
+| `--top_p` | `1.0` | top-p |
+| `--top_k` | `-1` | top-k |
+| `--presence_penalty` | `0.0` | 重复惩罚 |
+| `--system_prompt` | 无 | 统一系统提示词 |
+| `--recursive` | 关闭 | 递归扫描子目录 |
+| `--resume` | 关闭 | 已完整处理的文件跳过 |
+| `--save_jsonl` / `--no-save_jsonl` | 开启 | 是否保存完整字段的 jsonl 结果 |
+
+## 输入与输出
+
+### 输入
+
+```text
+datasets/
+├── group_a.jsonl
+└── subdir/
+    └── group_b.jsonl
+```
+
+### 输出
+
+```text
+output/
+├── group_a_output.txt
+├── group_a_output.jsonl
+└── subdir/
+    └── group_b_output.txt
+    └── group_b_output.jsonl
+```
+
+- `*_output.txt`：每行对应输入中的一条数据，内容为生成的 `output`。输出内部的换行会被替换为空格，保证行对齐。
+- `*_output.jsonl`：保留原始字段，并追加：
+  - `output`：生成内容
+  - `prompt_token_len` / `input_token_len` / `output_token_len`：token 数
+  - `output_time`：总耗时
+  - `ttft`：首 token 时间
+  - `tps`：输出 token/秒
+  - `success`：是否成功
+  - `error`：失败原因（成功时为空）
+- 使用 `--no-save_jsonl` 时只生成 `.txt`。
+- 使用 `--recursive` 时会保留输入的子目录结构。
+
+## 服务端参数说明
+
+`start_server.sh` 会根据设备总数和 `tp_size` 自动计算实例数量，并按 TP 档位选择性能参数。下表为 NPU 档位；GPU 的显存利用率统一默认为 `0.90`（可通过 `VLLM_GPU_MEM_UTIL` 覆盖），其余参数相同：
+
+| TP | 显存利用率（NPU） | max-num-seqs | max-num-batched-tokens | partial-prefills |
+| --- | --- | --- | --- | --- |
+| 1 | 0.92 | 128 | 32768 | 不启用 |
+| 2 | 0.95 | 128 | 16384 | 1 |
+| 4 | 0.93 | 96 | 32768 | 1 |
+| 8 | 0.90 | 64 | 65536 | 1 |
+| 其他 | 0.95 | 128 | 16384 | 不启用 |
+
+模型自适应参数：
+
+- **Qwen3.5+**：启用 `--language-model-only` + `qwen3_coder` tool parser
+- **MiniCPM5**：启用 `minicpm5` tool parser，可通过 `MINICPM5_PLUGIN` 指定插件路径
+- **其他模型**：默认 `hermes` tool parser
+
+## Nginx 说明
+
+`start_server.sh nginx` 会读取 `nginx_vllm.conf.template`，动态填入当前运行的 vLLM 端口并生成：
 
 | 路径 | 说明 |
 | --- | --- |
-| `.vllm_pids` | 所有 vLLM 实例的 PID 列表（与脚本同目录） |
-| `start_log/vllm_<时间戳>_<端口>.log` | 各 vLLM 实例的 stdout/stderr 日志 |
-| `start_log/nginx/access.log` / `error.log` | Nginx 访问与错误日志 |
-| `start_log/nginx/nginx.pid` | Nginx 主进程 PID |
-| `/etc/nginx/nginx.conf` | `nginx` 命令生成的配置文件 |
+| `/tmp/nginx_vllm.conf` | 生成的 Nginx 配置 |
+| `/tmp/nginx_vllm.pid` | Nginx 主进程 PID |
+| `/tmp/nginx_vllm_access.log` | Nginx 访问日志 |
+| `/tmp/nginx_vllm_error.log` | Nginx 错误日志 |
+
+配置特点：
+
+- `location /` 统一反向代理到所有 vLLM 实例
+- 一致性哈希 + keepalive 长连接
+- `proxy_buffering off`，支持 SSE 流式输出
+- 读写超时 1800s，连接超时 30s
+- 后端故障自动切换
+
+## 运行产物
+
+| 路径 | 说明 |
+| --- | --- |
+| `.vllm_pids` | 所有 vLLM 实例 PID 列表 |
+| `logs/vllm_<时间戳>_<端口>.log` | 各 vLLM 实例运行日志 |
+| `/tmp/nginx_vllm_*.log` | Nginx 访问/错误日志 |
+| `output/*_output.txt` | 每条输入对应的生成结果 |
+| `output/*_output.jsonl` | 完整结果与性能指标 |
 
 ## 验证服务
 
@@ -124,15 +279,26 @@ nginx -c /tmp/nginx_vllm.conf
 # 单实例健康检查
 curl --noproxy '*' http://localhost:8000/health
 
-# 通过 Nginx 统一入口调用 OpenAI 兼容接口
-curl http://localhost:1358/v1/chat/completions \
+# 通过 Nginx 查看模型列表
+curl --noproxy '*' http://localhost:1358/v1/models
+
+# 调用 OpenAI 兼容接口
+curl --noproxy '*' http://localhost:1358/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "MyModel", "messages": [{"role": "user", "content": "你好"}]}'
+  -d '{"model":"MyModel","messages":[{"role":"user","content":"你好"}]}'
 ```
 
 ## 注意事项
 
-- 端口被占用时该实例会被跳过并输出 WARN，不会中断整体启动流程
-- `nginx` 命令会直接覆盖 `/etc/nginx/nginx.conf`，如机器上已有其他 Nginx 业务请谨慎使用
-- 部分实例健康检查超时只会给出 WARN 提示，请查看对应日志定位原因（如显存不足、模型加载失败）
-- `start_work copy.sh` 为旧版本备份：其 `do_nginx` 基于 `nginx_vllm.conf.template` 渲染配置到 `/tmp`，并用 `ss` 实时探测 vLLM 端口，可作为参考
+- 运行前安装客户端依赖：`pip install openai httpx tqdm`
+- NPU 环境需要 `npu-smi`，GPU 环境需要 `nvidia-smi`；自动识别失败时请设置 `DEVICE_BACKEND=npu|gpu`。
+- GPU 默认 `--dtype auto`，NPU 默认 `--dtype bfloat16`；如需强制指定，设置 `VLLM_DTYPE`。
+- 如果 `run_pipeline.sh` 检测到服务已运行，会跳过启动；请确保 `MODEL_NAME` 与 `/v1/models` 中的模型名一致，否则会给出 WARN。
+- `start_server.sh start` 检测到已存在存活的 vLLM 实例时会拒绝启动，需先执行 `stop`，避免旧进程失去 PID 跟踪。
+- `start_server.sh stop` 会先发送 SIGTERM，等待最多 30s；仍未退出的 vLLM 进程会被强制结束，Nginx 最多等待 10s。
+- 端口被占用时，对应 vLLM 实例会被跳过并输出 WARN，不影响其他实例。
+- 部分实例健康检查超时只会输出 WARN，请查看 `logs/` 下的日志定位原因。
+- `STOP_AFTER=1` 时，无论推理成功还是失败，脚本退出前都会停止 vLLM 与 Nginx。
+- `--resume` 依据 `.txt` 行数与输入行数是否一致判断，若中途失败较多，建议先删除对应输出后重跑。
+- 默认 `--concurrency 64`；如果 Nginx 或 vLLM 出现超时/拒绝连接，可适当降低并发，或根据 NPU 数量提高。
+- 输入字段不限于 `prompt`：例如 `datasets/gpqa.jsonl` 使用 `question` 字段，客户端会自动识别。

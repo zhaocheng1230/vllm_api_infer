@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行时产物
+.vllm_pids
+logs/
+output/
+
+# 系统文件
+.DS_Store
