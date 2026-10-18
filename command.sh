@@ -16,7 +16,7 @@ apt-get update && apt-get install -y curl
 export MODEL_PATH=/root/private_data/models/Qwen/Qwen3.5-4B
 export MODEL_NAME=Qwen3.5-4B
 export TP_SIZE=1
-export CONCURRENCY=128
+export CONCURRENCY=64
 export STOP_AFTER=1
 
 bash run_pipeline.sh

@@ -19,7 +19,7 @@
 ├── .gitignore                   # 忽略运行时产物
 ├── datasets/                    # 输入目录（*.jsonl）
 ├── output/                      # 输出目录
-└── logs/                        # vLLM 实例日志（运行后生成）
+└── logs/<date>/<model>/         # 每个任务独立的运行状态与日志
 ```
 
 ## 环境要求
@@ -28,7 +28,7 @@
 - vLLM（NPU 使用昇腾适配版；GPU 使用官方 GPU 版）
 - NPU：Ascend NPU + `npu-smi`
 - GPU：NVIDIA GPU + `nvidia-smi`
-- Nginx ≥ 1.19.8（一致哈希需要）
+- Nginx（`least_conn` 负载均衡）
 - Python 依赖：`openai`、`httpx`、`tqdm`（可选）
 - 常用工具：`ss` / `netstat`、`curl`、`ps`
 
@@ -114,16 +114,44 @@ NPU 默认参数：
 
 ```bash
 # 启动 vLLM 实例（按设备总数 / tp_size 自动计算实例数）
-bash start_server.sh start <model_path> <model_name> <tp_size> [max_model_len]
+# date_str 默认为当天，也可用 DATE_STR 环境变量指定
+bash start_server.sh start <model_path> <model_name> <tp_size> [date_str] [max_model_len]
 
-# 启动/重载 Nginx（默认监听 1358）
-bash start_server.sh nginx [listen_port]
+# 启动/重载 Nginx（默认监听 1358；缺省自动识别最近启动的任务）
+bash start_server.sh nginx [listen_port] [date_str] [model_name]
 
-# 查看 vLLM 与 Nginx 状态
-bash start_server.sh status
+# 查看状态：指定任务或查看全部任务
+bash start_server.sh status [model_name] [date_str]
 
-# 停止所有 vLLM 实例与 Nginx
-bash start_server.sh stop
+# 停止指定任务的 vLLM 实例与 Nginx
+bash start_server.sh stop <model_name> [date_str]
+```
+
+每个任务的运行时状态、Nginx 配置和日志互相隔离，统一放在：
+
+```text
+logs/<date_str>/<model_name>/
+├── vllm.pids              # 该任务所有 vLLM 实例 PID
+├── vllm_<时间戳>_<端口>.log
+├── nginx.conf
+├── nginx.pid
+├── nginx_access.log
+└── nginx_error.log
+```
+
+这样多个任务挂载同一份代码目录时，`start` / `stop` / `status` 不会互相覆盖。模型名中的 `/` 等特殊字符会被替换为 `_`。
+
+典型任务流程：
+
+```bash
+current_date=$(date +%Y%m%d)
+
+bash start_server.sh start "$MODEL_PATH" "$MODEL_NAME" "$TP_SIZE" "$current_date"
+bash start_server.sh nginx "$NGINX_PORT"   # 自动识别刚启动的任务
+
+# ... 执行推理 ...
+
+bash start_server.sh stop "$MODEL_NAME" "$current_date"
 ```
 
 ### 客户端推理
@@ -152,6 +180,7 @@ python vllm_infer.py \
 | `MAX_MODEL_LEN` | `131072` | 最大模型长度 |
 | `VLLM_BASE_PORT` | `8000` | vLLM 实例起始端口 |
 | `NGINX_PORT` | `1358` | Nginx 监听端口 |
+| `DATE_STR` | 当天 `YYYYMMDD` | 任务日期目录名 |
 | `CONCURRENCY` | `64` | 推理并发数 |
 | `STOP_AFTER` | `0` | 推理结束后是否停止服务（`1` 为停止） |
 | `PYTHON` | `python` | Python 解释器命令 |
@@ -247,14 +276,14 @@ output/
 
 ## Nginx 说明
 
-`start_server.sh nginx` 会读取 `nginx_vllm.conf.template`，动态填入当前运行的 vLLM 端口并生成：
+`start_server.sh nginx` 会读取 `nginx_vllm.conf.template`，从当前任务的 PID 文件动态填入 vLLM 端口，并在任务目录下生成：
 
 | 路径 | 说明 |
 | --- | --- |
-| `/tmp/nginx_vllm.conf` | 生成的 Nginx 配置 |
-| `/tmp/nginx_vllm.pid` | Nginx 主进程 PID |
-| `/tmp/nginx_vllm_access.log` | Nginx 访问日志 |
-| `/tmp/nginx_vllm_error.log` | Nginx 错误日志 |
+| `logs/<date>/<model>/nginx.conf` | 生成的 Nginx 配置 |
+| `logs/<date>/<model>/nginx.pid` | Nginx 主进程 PID |
+| `logs/<date>/<model>/nginx_access.log` | Nginx 访问日志 |
+| `logs/<date>/<model>/nginx_error.log` | Nginx 错误日志 |
 
 配置特点：
 
@@ -268,9 +297,9 @@ output/
 
 | 路径 | 说明 |
 | --- | --- |
-| `.vllm_pids` | 所有 vLLM 实例 PID 列表 |
-| `logs/vllm_<时间戳>_<端口>.log` | 各 vLLM 实例运行日志 |
-| `/tmp/nginx_vllm_*.log` | Nginx 访问/错误日志 |
+| `logs/<date>/<model>/vllm.pids` | 该任务所有 vLLM 实例 PID 列表 |
+| `logs/<date>/<model>/vllm_<时间戳>_<端口>.log` | 各 vLLM 实例运行日志 |
+| `logs/<date>/<model>/nginx_*.log` | Nginx 访问/错误日志 |
 | `output/*_output.txt` | 每条输入对应的生成结果 |
 | `output/*_output.jsonl` | 完整结果与性能指标 |
 
@@ -295,8 +324,9 @@ curl --noproxy '*' http://localhost:1358/v1/chat/completions \
 - NPU 环境需要 `npu-smi`，GPU 环境需要 `nvidia-smi`；自动识别失败时请设置 `DEVICE_BACKEND=npu|gpu`。
 - GPU 默认 `--dtype auto`，NPU 默认 `--dtype bfloat16`；如需强制指定，设置 `VLLM_DTYPE`。
 - 如果 `run_pipeline.sh` 检测到服务已运行，会跳过启动；请确保 `MODEL_NAME` 与 `/v1/models` 中的模型名一致，否则会给出 WARN。
-- `start_server.sh start` 检测到已存在存活的 vLLM 实例时会拒绝启动，需先执行 `stop`，避免旧进程失去 PID 跟踪。
-- `start_server.sh stop` 会先发送 SIGTERM，等待最多 30s；仍未退出的 vLLM 进程会被强制结束，Nginx 最多等待 10s。
+- `start_server.sh start` 检测到同一任务（相同 `date_str` + `model_name`）已有存活的 vLLM 实例时会拒绝启动，需先停止该任务；不同任务互不影响。
+- `start_server.sh stop` 只停止指定任务；`status` 不带参数时列出 `logs/<date>/<model>/` 下的所有任务。停止时先发送 SIGTERM，等待最多 30s；仍未退出的 vLLM 进程会被强制结束，Nginx 最多等待 10s。
+- `start_server.sh nginx` 不带 `date_str`/`model_name` 时，会自动选择最近启动且仍在运行的任务；显式传参更稳妥。
 - 端口被占用时，对应 vLLM 实例会被跳过并输出 WARN，不影响其他实例。
 - Nginx 使用 `least_conn` 负载均衡，适合单机异步批量推理；如果仍出现某个实例明显空闲，可检查客户端是否只建立了单一长连接，或尝试降低 `keepalive` 数量。
 - 部分实例健康检查超时只会输出 WARN，请查看 `logs/` 下的日志定位原因。

@@ -11,6 +11,7 @@
 #   MAX_MODEL_LEN   默认 131072
 #   VLLM_BASE_PORT  vLLM 实例起始端口，默认 8000
 #   NGINX_PORT      Nginx 监听端口，默认 1358
+#   DATE_STR        任务日期目录，默认当天 $(date +%Y%m%d)
 #   CONCURRENCY     推理并发数，默认 64
 #   STOP_AFTER      推理结束后是否停止服务，0/1，默认 0
 
@@ -33,6 +34,7 @@ MODEL_PATH="${MODEL_PATH:-}"
 MODEL_NAME="${MODEL_NAME:-}"
 TP_SIZE="${TP_SIZE:-2}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
+DATE_STR="${DATE_STR:-$(date +%Y%m%d)}"
 CONCURRENCY="${CONCURRENCY:-64}"
 STOP_AFTER="${STOP_AFTER:-0}"
 PYTHON="${PYTHON:-python}"
@@ -41,7 +43,7 @@ SERVICE_READY=0
 cleanup() {
     if [ "$STOP_AFTER" = "1" ] && [ "$SERVICE_READY" = "1" ]; then
         echo "[INFO] 停止 vLLM + Nginx 服务"
-        bash "${SCRIPT_DIR}/start_server.sh" stop
+        bash "${SCRIPT_DIR}/start_server.sh" stop "${MODEL_NAME}" "${DATE_STR}"
     fi
 }
 trap cleanup EXIT
@@ -69,11 +71,11 @@ if curl -s --noproxy '*' "$HEALTH_URL" >/dev/null 2>&1; then
         echo "[WARN] 服务已运行，但 /v1/models 中未找到模型 ${MODEL_NAME}，请确认 MODEL_NAME 是否匹配"
     fi
 else
-    echo "[INFO] 启动 vLLM 实例: model=${MODEL_NAME}, tp=${TP_SIZE}"
-    bash "${SCRIPT_DIR}/start_server.sh" start "${MODEL_PATH}" "${MODEL_NAME}" "${TP_SIZE}" "${MAX_MODEL_LEN}"
+    echo "[INFO] 启动 vLLM 实例: model=${MODEL_NAME}, tp=${TP_SIZE}, date=${DATE_STR}"
+    bash "${SCRIPT_DIR}/start_server.sh" start "${MODEL_PATH}" "${MODEL_NAME}" "${TP_SIZE}" "${DATE_STR}" "${MAX_MODEL_LEN}"
 
     echo "[INFO] 启动 Nginx 反向代理: port=${NGINX_PORT}"
-    bash "${SCRIPT_DIR}/start_server.sh" nginx "${NGINX_PORT}"
+    bash "${SCRIPT_DIR}/start_server.sh" nginx "${NGINX_PORT}" "${MODEL_NAME}" "${DATE_STR}"
 fi
 
 echo "[INFO] 等待服务就绪: ${HEALTH_URL}"
@@ -85,7 +87,7 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 if [ "$SERVICE_READY" != "1" ]; then
-    echo "[ERROR] 服务在 60s 内未就绪，请检查 logs/ 与 /tmp/nginx_vllm_error.log"
+    echo "[ERROR] 服务在 60s 内未就绪，请检查 logs/${DATE_STR}/${MODEL_NAME}/ 与 nginx_error.log"
     exit 1
 fi
 echo "[INFO] 服务已就绪"

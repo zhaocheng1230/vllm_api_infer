@@ -1,12 +1,16 @@
 #!/bin/bash
 # start_server.sh - vLLM 多实例启动 + Nginx 反向代理管理（Ascend NPU / NVIDIA GPU 通用）
 # 用法:
-#   bash start_server.sh start <model_path> <model_name> <tp_size> [max_model_len]
-#   bash start_server.sh nginx <listen_port>
-#   bash start_server.sh status
-#   bash start_server.sh stop
+#   bash start_server.sh start <model_path> <model_name> <tp_size> [date_str] [max_model_len]
+#   bash start_server.sh nginx [listen_port] [date_str] [model_name]
+#   bash start_server.sh status [model_name] [date_str]
+#   bash start_server.sh stop   <model_name> [date_str]
+#
+# 每个任务独立存放运行时状态: logs/<date_str>/<model_name>/
+#   date_str 默认当天日期 $(date +%Y%m%d)，可通过第 4 个参数或 DATE_STR 覆盖
 #
 # 可选环境变量:
+#   DATE_STR=YYYYMMDD             # 默认任务日期
 #   DEVICE_BACKEND=auto|npu|gpu   # 默认 auto，按 npu-smi / nvidia-smi 自动识别
 #   DEVICE_COUNT=N                # 覆盖自动检测到的设备数量
 #   VLLM_GPU_MEM_UTIL=0.90        # GPU 显存利用率（NPU 使用 TP 档位内置值）
@@ -15,12 +19,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PID_FILE="${SCRIPT_DIR}/.vllm_pids"
-TASK_LOG_DIR="${SCRIPT_DIR}/logs"
-NGINX_PID="/tmp/nginx_vllm.pid"
-NGINX_CONF="/tmp/nginx_vllm.conf"
-NGINX_ERROR_LOG="/tmp/nginx_vllm_error.log"
-NGINX_ACCESS_LOG="/tmp/nginx_vllm_access.log"
+BASE_LOG_DIR="${SCRIPT_DIR}/logs"
+DEFAULT_DATE_STR="${DATE_STR:-$(date +%Y%m%d)}"
+
+# 任务相关路径，由 set_task_paths() 填充
+DATE_STR="$DEFAULT_DATE_STR"
+MODEL_DIR=""
+TASK_LOG_DIR=""
+PID_FILE=""
+NGINX_PID=""
+NGINX_CONF=""
+NGINX_ERROR_LOG=""
+NGINX_ACCESS_LOG=""
 
 # 默认后端：优先读取 DEVICE_BACKEND，未设置则自动检测，默认值为 auto，可选项npu|gpu
 DEFAULT_BACKEND="${DEVICE_BACKEND:-auto}"
@@ -31,6 +41,26 @@ log_info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 log_ok()   { echo -e "\033[1;32m[OK]\033[0m $*"; }
 log_warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 log_err()  { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; }
+
+set_task_paths() {
+    local date_str="${1:-$DEFAULT_DATE_STR}"
+    local model_name="${2:-}"
+    [ -n "$model_name" ] || { log_err "缺少 model_name"; exit 1; }
+
+    DATE_STR="$date_str"
+    MODEL_DIR="${model_name//\//_}"
+    TASK_LOG_DIR="${BASE_LOG_DIR}/${DATE_STR}/${MODEL_DIR}"
+    PID_FILE="${TASK_LOG_DIR}/vllm.pids"
+    NGINX_PID="${TASK_LOG_DIR}/nginx.pid"
+    NGINX_CONF="${TASK_LOG_DIR}/nginx.conf"
+    NGINX_ERROR_LOG="${TASK_LOG_DIR}/nginx_error.log"
+    NGINX_ACCESS_LOG="${TASK_LOG_DIR}/nginx_access.log"
+}
+
+latest_task_dir() {
+    [ -d "$BASE_LOG_DIR" ] || return 1
+    find "$BASE_LOG_DIR" -mindepth 2 -maxdepth 2 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-
+}
 
 check_port_available() {
     ! ss -tlnp 2>/dev/null | grep -q ":${1} " && \
@@ -50,8 +80,10 @@ wait_for_port() {
 }
 
 detect_vllm_ports() {
+    local pid_file="${1:-$PID_FILE}"
     local ports=""
-    if [ -f "$PID_FILE" ]; then
+
+    if [ -f "$pid_file" ]; then
         while read -r pid; do
             [ -z "$pid" ] && continue
             if kill -0 "$pid" 2>/dev/null; then
@@ -59,11 +91,9 @@ detect_vllm_ports() {
                 p=$(ps -p "$pid" -o args= 2>/dev/null | grep -oP '(?<=--port )\d+' || true)
                 [ -n "$p" ] && ports="${ports}${p}"$'\n'
             fi
-        done < "$PID_FILE"
+        done < "$pid_file"
     fi
-    if [ -z "$ports" ]; then
-        ports=$(ss -tlnp 2>/dev/null | grep '"vllm"' | grep -oP '(?<=0\.0\.0\.0:)\d+' || true)
-    fi
+
     printf "%s" "$ports" | sort -n | uniq
 }
 
@@ -228,7 +258,8 @@ do_start() {
     local MODEL_PATH="${1:-}"
     local MODEL_NAME="${2:-}"
     local TP_SIZE="${3:-2}"
-    local MAX_MODEL_LEN="${4:-131072}"
+    local DATE_STR_ARG="${4:-$DEFAULT_DATE_STR}"
+    local MAX_MODEL_LEN="${5:-${MAX_MODEL_LEN:-131072}}"
     local BASE_PORT="${VLLM_BASE_PORT:-8000}"
 
     [ -z "$MODEL_PATH" ] && { log_err "缺少 model_path"; exit 1; }
@@ -237,6 +268,8 @@ do_start() {
         log_err "tp_size 必须是正整数: $TP_SIZE"
         exit 1
     fi
+
+    set_task_paths "$DATE_STR_ARG" "$MODEL_NAME"
 
     # 1) 后端识别
     local BACKEND
@@ -259,7 +292,8 @@ do_start() {
             kill -0 "$pid" 2>/dev/null && alive_pids+=("$pid")
         done < "$PID_FILE"
         if [ ${#alive_pids[@]} -gt 0 ]; then
-            log_err "已有 vLLM 实例在运行 (PID: ${alive_pids[*]})，请先执行 stop"
+            log_err "同一任务已有 vLLM 实例在运行 (PID: ${alive_pids[*]})"
+            log_err "请先停止: bash $0 stop \"${MODEL_PATH}\" \"${MODEL_NAME}\" ${TP_SIZE} ${DATE_STR}"
             exit 1
         fi
     fi
@@ -294,6 +328,8 @@ do_start() {
     echo "========================================="
     echo "  模型路径:       $MODEL_PATH"
     echo "  模型名称:       $MODEL_NAME"
+    echo "  任务日期:       $DATE_STR"
+    echo "  任务目录:       $TASK_LOG_DIR"
     echo "  设备后端:       $BACKEND"
     echo "  设备总数:       $DEVICE_TOTAL"
     echo "  设备列表:       $(IFS=,; echo "${DEVICE_IDS[*]:0:$DEVICE_TOTAL}")"
@@ -370,9 +406,10 @@ do_start() {
     if [ $ready_count -eq ${#started_ports[@]} ]; then
         echo "========================================="
         log_ok "启动完成！${ready_count}/${#started_ports[@]} 个实例就绪"
+        echo "  任务目录: ${TASK_LOG_DIR}"
         echo "  查看日志: tail -f ${TASK_LOG_DIR}/vllm_*.log"
-        echo "  查看状态: bash $0 status"
-        echo "  停止服务: bash $0 stop"
+        echo "  查看状态: bash $0 status \"${MODEL_NAME}\" ${DATE_STR}"
+        echo "  停止服务: bash $0 stop \"${MODEL_NAME}\" ${DATE_STR}"
         echo "  健康检查: curl --noproxy '*' http://localhost:${started_ports[0]}/health"
         echo "========================================="
     else
@@ -386,7 +423,9 @@ do_start() {
 # ========================== NGINX 配置生成 ==========================
 do_nginx() {
     local listen_port="${1:-1358}"
-    local template_file="$(dirname "$0")/nginx_vllm.conf.template"
+    local model_arg="${2:-}"
+    local date_arg="${3:-}"
+    local template_file="${SCRIPT_DIR}/nginx_vllm.conf.template"
 
     if ! command -v nginx >/dev/null 2>&1; then
         log_err "未找到 nginx 命令，请先安装 Nginx 或将其加入 PATH"
@@ -397,13 +436,33 @@ do_nginx() {
 
     [ -f "$template_file" ] || { log_err "模板文件不存在: ${template_file}"; exit 1; }
 
-    # 动态检测 vLLM 端口（优先从 PID 文件解析，ss 作为兜底）
-    local ports
-    ports=$(detect_vllm_ports)
-    [ -n "$ports" ] || { log_err "未检测到任何 vllm 监听端口，请先执行 start"; exit 1; }
+    # 定位任务：显式参数优先，否则取最近创建的任务目录
+    if [ -z "$model_arg" ] && [ -n "${MODEL_NAME:-}" ]; then
+        model_arg="$MODEL_NAME"
+    fi
 
-    local port_count=$(echo "$ports" | wc -l)
-    echo "检测到 ${port_count} 个 vLLM 实例端口: $(echo $ports | tr '\n' ' ')"
+    if [ -n "$model_arg" ]; then
+        set_task_paths "${date_arg:-$DEFAULT_DATE_STR}" "$model_arg"
+    else
+        local task_dir
+        task_dir=$(latest_task_dir) || { log_err "未找到任务，请先执行 start 或指定 model_name"; exit 1; }
+        set_task_paths "$(basename "$(dirname "$task_dir")")" "$(basename "$task_dir")"
+        log_info "自动识别任务: ${DATE_STR}/${MODEL_DIR}"
+    fi
+
+    mkdir -p "$TASK_LOG_DIR"
+
+    # 从该任务自己的 PID 文件解析 vLLM 端口
+    local ports
+    ports=$(detect_vllm_ports "$PID_FILE")
+    if [ -z "$ports" ]; then
+        log_err "任务 ${DATE_STR}/${MODEL_DIR} 没有运行中的 vLLM 实例，请先执行 start"
+        exit 1
+    fi
+
+    local port_count
+    port_count=$(echo "$ports" | wc -l)
+    echo "任务 ${DATE_STR}/${MODEL_DIR}: 检测到 ${port_count} 个 vLLM 实例端口: $(echo $ports | tr '\n' ' ')"
 
     # 生成 upstream server 块
     local upstream_servers=""
@@ -418,7 +477,8 @@ do_nginx() {
         -e "s|{{LISTEN_PORT}}|${listen_port}|g" \
         "$template_file" > "$NGINX_CONF"
 
-    local tmp_conf=$(mktemp)
+    local tmp_conf
+    tmp_conf=$(mktemp)
     awk -v servers="$upstream_servers" '
         /\{\{UPSTREAM_SERVERS\}\}/ { printf "%s", servers; next }
         { print }
@@ -463,11 +523,14 @@ do_nginx() {
 
 # ========================== status 命令 ==========================
 
-do_status() {
-    echo "=== vLLM 进程 ==="
+print_task_status() {
+    echo "=== 任务 ${DATE_STR}/${MODEL_DIR} ==="
+    echo "  目录: ${TASK_LOG_DIR}"
+    echo "--- vLLM 进程 ---"
     if [ -f "$PID_FILE" ]; then
         local alive=0 dead=0
         while read -r pid; do
+            [ -z "$pid" ] && continue
             if kill -0 "$pid" 2>/dev/null; then
                 local port
                 port=$(ps -p "$pid" -o args= 2>/dev/null | grep -oP '(?<=--port )\d+' || echo "?")
@@ -484,7 +547,7 @@ do_status() {
     fi
 
     echo ""
-    echo "=== Nginx ==="
+    echo "--- Nginx ---"
     if [ -f "$NGINX_PID" ]; then
         local npid
         npid=$(cat "$NGINX_PID" 2>/dev/null || true)
@@ -498,9 +561,41 @@ do_status() {
     fi
 }
 
+do_status() {
+    if [ "$#" -gt 0 ]; then
+        local MODEL_NAME="$1"
+        local DATE_STR_ARG="${2:-$DEFAULT_DATE_STR}"
+        set_task_paths "$DATE_STR_ARG" "$MODEL_NAME"
+        print_task_status
+        return 0
+    fi
+
+    local found=0
+    local dir
+    while IFS= read -r dir; do
+        [ -n "$dir" ] || continue
+        set_task_paths "$(basename "$(dirname "$dir")")" "$(basename "$dir")"
+        print_task_status
+        echo ""
+        found=1
+    done < <(find "$BASE_LOG_DIR" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort)
+
+    if [ "$found" -eq 0 ]; then
+        echo "未找到任何任务目录: ${BASE_LOG_DIR}/<date_str>/<model_name>"
+    fi
+}
+
 # ========================== stop 命令 ==========================
 
 do_stop() {
+    local MODEL_NAME="${1:-}"
+    local DATE_STR_ARG="${2:-$DEFAULT_DATE_STR}"
+    [ -z "$MODEL_NAME" ] && { log_err "缺少 model_name"; exit 1; }
+
+    set_task_paths "$DATE_STR_ARG" "$MODEL_NAME"
+
+    echo "任务目录: ${TASK_LOG_DIR}"
+
     local count=0
     local pids=()
 
@@ -571,15 +666,17 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     case "${1:-}" in
         start)  shift; do_start "$@" ;;
         nginx)  shift; do_nginx "$@" ;;
-        status) do_status ;;
-        stop)   do_stop ;;
+        status) shift; do_status "$@" ;;
+        stop)   shift; do_stop "$@" ;;
         *)
             echo "用法: bash $0 {start|nginx|status|stop}"
             echo ""
-            echo "  start  <model_path> <model_name> <tp_size> [max_model_len]"
-            echo "  nginx  [listen_port]          # 默认 1358"
-            echo "  status                        # 查看运行状态"
-            echo "  stop                          # 停止所有服务"
+            echo "  start  <model_path> <model_name> <tp_size> [date_str] [max_model_len]"
+            echo "  nginx  [listen_port] [date_str] [model_name]   # 缺省自动识别最近启动的任务"
+            echo "  status [model_name] [date_str]   # 缺省显示所有任务"
+            echo "  stop   <model_name> [date_str]"
+            echo ""
+            echo "  date_str 默认 ${DEFAULT_DATE_STR}，运行状态存放于 logs/<date_str>/<model_name>/"
             exit 1
             ;;
     esac
