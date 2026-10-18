@@ -10,8 +10,9 @@ conda create -n vllm-23-env python=3.11 -y \
 conda activate vllm-23-env
 pip install vllm==0.23.0
 
-sudo apt-get update && sudo apt-get install -y nginx
-apt-get update && apt-get install -y curl
+apt-get update && apt-get install -y nginx curl
+
+bash ./start_server.sh stop Qwen3.5-4B 20261018
 
 export MODEL_PATH=/root/private_data/models/Qwen/Qwen3.5-4B
 export MODEL_NAME=Qwen3.5-4B

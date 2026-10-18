@@ -12,6 +12,8 @@
 #   VLLM_BASE_PORT  vLLM 实例起始端口，默认 8000
 #   NGINX_PORT      Nginx 监听端口，默认 1358
 #   DATE_STR        任务日期目录，默认当天 $(date +%Y%m%d)
+#   STARTUP_TIMEOUT 单实例启动等待时间（秒），默认 900
+#   READY_TIMEOUT   等待 Nginx 入口就绪的时间（秒），默认 120
 #   CONCURRENCY     推理并发数，默认 64
 #   STOP_AFTER      推理结束后是否停止服务，0/1，默认 0
 
@@ -38,6 +40,7 @@ DATE_STR="${DATE_STR:-$(date +%Y%m%d)}"
 CONCURRENCY="${CONCURRENCY:-64}"
 STOP_AFTER="${STOP_AFTER:-0}"
 PYTHON="${PYTHON:-python}"
+READY_TIMEOUT="${READY_TIMEOUT:-120}"
 
 SERVICE_READY=0
 cleanup() {
@@ -72,14 +75,17 @@ if curl -s --noproxy '*' "$HEALTH_URL" >/dev/null 2>&1; then
     fi
 else
     echo "[INFO] 启动 vLLM 实例: model=${MODEL_NAME}, tp=${TP_SIZE}, date=${DATE_STR}"
-    bash "${SCRIPT_DIR}/start_server.sh" start "${MODEL_PATH}" "${MODEL_NAME}" "${TP_SIZE}" "${DATE_STR}" "${MAX_MODEL_LEN}"
+    if ! bash "${SCRIPT_DIR}/start_server.sh" start "${MODEL_PATH}" "${MODEL_NAME}" "${TP_SIZE}" "${DATE_STR}" "${MAX_MODEL_LEN}"; then
+        echo "[ERROR] vLLM 启动失败，请查看 logs/${DATE_STR}/${MODEL_NAME}/vllm_*.log"
+        exit 1
+    fi
 
     echo "[INFO] 启动 Nginx 反向代理: port=${NGINX_PORT}"
     bash "${SCRIPT_DIR}/start_server.sh" nginx "${NGINX_PORT}" "${MODEL_NAME}" "${DATE_STR}"
 fi
 
 echo "[INFO] 等待服务就绪: ${HEALTH_URL}"
-for _ in $(seq 1 60); do
+for _ in $(seq 1 "$READY_TIMEOUT"); do
     if curl -s --noproxy '*' "$HEALTH_URL" >/dev/null 2>&1; then
         SERVICE_READY=1
         break
@@ -87,7 +93,7 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 if [ "$SERVICE_READY" != "1" ]; then
-    echo "[ERROR] 服务在 60s 内未就绪，请检查 logs/${DATE_STR}/${MODEL_NAME}/ 与 nginx_error.log"
+    echo "[ERROR] 服务在 ${READY_TIMEOUT}s 内未就绪，请检查 logs/${DATE_STR}/${MODEL_NAME}/ 与 nginx_error.log"
     exit 1
 fi
 echo "[INFO] 服务已就绪"

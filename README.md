@@ -181,6 +181,8 @@ python vllm_infer.py \
 | `VLLM_BASE_PORT` | `8000` | vLLM 实例起始端口 |
 | `NGINX_PORT` | `1358` | Nginx 监听端口 |
 | `DATE_STR` | 当天 `YYYYMMDD` | 任务日期目录名 |
+| `STARTUP_TIMEOUT` | `900` | 单实例启动等待时间（秒），冷启动大模型可适当调大 |
+| `READY_TIMEOUT` | `120` | 启动后等待 Nginx 入口就绪的时间（秒） |
 | `CONCURRENCY` | `64` | 推理并发数 |
 | `STOP_AFTER` | `0` | 推理结束后是否停止服务（`1` 为停止） |
 | `PYTHON` | `python` | Python 解释器命令 |
@@ -326,7 +328,7 @@ curl --noproxy '*' http://localhost:1358/v1/chat/completions \
 - 如果 `run_pipeline.sh` 检测到服务已运行，会跳过启动；请确保 `MODEL_NAME` 与 `/v1/models` 中的模型名一致，否则会给出 WARN。
 - `start_server.sh start` 检测到同一任务（相同 `date_str` + `model_name`）已有存活的 vLLM 实例时会拒绝启动，需先停止该任务；不同任务互不影响。
 - `start_server.sh stop` 只停止指定任务；`status` 不带参数时列出 `logs/<date>/<model>/` 下的所有任务。停止时先发送 SIGTERM，等待最多 30s；仍未退出的 vLLM 进程会被强制结束，Nginx 最多等待 10s。
-- `start_server.sh nginx` 不带 `date_str`/`model_name` 时，会自动选择最近启动且仍在运行的任务；显式传参更稳妥。
+- `start_server.sh nginx` 不带 `model_name`/`date_str` 时，会自动选择最近创建的任务目录；显式传参更稳妥。
 - 端口被占用时，对应 vLLM 实例会被跳过并输出 WARN，不影响其他实例。
 - Nginx 使用 `least_conn` 负载均衡，适合单机异步批量推理；如果仍出现某个实例明显空闲，可检查客户端是否只建立了单一长连接，或尝试降低 `keepalive` 数量。
 - 部分实例健康检查超时只会输出 WARN，请查看 `logs/` 下的日志定位原因。

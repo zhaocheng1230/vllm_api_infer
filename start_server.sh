@@ -2,7 +2,7 @@
 # start_server.sh - vLLM 多实例启动 + Nginx 反向代理管理（Ascend NPU / NVIDIA GPU 通用）
 # 用法:
 #   bash start_server.sh start <model_path> <model_name> <tp_size> [date_str] [max_model_len]
-#   bash start_server.sh nginx [listen_port] [date_str] [model_name]
+#   bash start_server.sh nginx [listen_port] [model_name] [date_str]
 #   bash start_server.sh status [model_name] [date_str]
 #   bash start_server.sh stop   <model_name> [date_str]
 #
@@ -15,6 +15,7 @@
 #   DEVICE_COUNT=N                # 覆盖自动检测到的设备数量
 #   VLLM_GPU_MEM_UTIL=0.90        # GPU 显存利用率（NPU 使用 TP 档位内置值）
 #   VLLM_DTYPE=auto|bfloat16      # 覆盖 dtype（GPU 默认 auto，NPU 默认 bfloat16）
+#   STARTUP_TIMEOUT=900           # 单实例启动等待时间（秒）
 
 set -euo pipefail
 
@@ -34,6 +35,8 @@ NGINX_ACCESS_LOG=""
 
 # 默认后端：优先读取 DEVICE_BACKEND，未设置则自动检测，默认值为 auto，可选项npu|gpu
 DEFAULT_BACKEND="${DEVICE_BACKEND:-auto}"
+# 单个实例启动等待时间（秒）；冷启动加载大模型可能超过 5 分钟
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-900}"
 
 # ========================== 工具函数 ==========================
 
@@ -394,7 +397,7 @@ do_start() {
 
     local ready_count=0
     for port in "${started_ports[@]}"; do
-        if wait_for_port "$port" 300; then
+        if wait_for_port "$port" "$STARTUP_TIMEOUT"; then
             echo "  ✅ 端口 $port 已就绪"
             ready_count=$((ready_count + 1))
         else
@@ -413,7 +416,10 @@ do_start() {
         echo "  健康检查: curl --noproxy '*' http://localhost:${started_ports[0]}/health"
         echo "========================================="
     else
-        log_warn "部分实例未就绪: ${ready_count}/${#started_ports[@]}"
+        log_err "部分实例未就绪: ${ready_count}/${#started_ports[@]}（等待 ${STARTUP_TIMEOUT}s）"
+        log_err "请查看 ${TASK_LOG_DIR}/vllm_*.log"
+        log_err "确认失败后可执行: bash $0 stop \"${MODEL_NAME}\" ${DATE_STR}"
+        exit 1
     fi
 
     # 输出端口列表供外部脚本使用
@@ -672,7 +678,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             echo "用法: bash $0 {start|nginx|status|stop}"
             echo ""
             echo "  start  <model_path> <model_name> <tp_size> [date_str] [max_model_len]"
-            echo "  nginx  [listen_port] [date_str] [model_name]   # 缺省自动识别最近启动的任务"
+            echo "  nginx  [listen_port] [model_name] [date_str]   # 缺省自动识别最近启动的任务"
             echo "  status [model_name] [date_str]   # 缺省显示所有任务"
             echo "  stop   <model_name> [date_str]"
             echo ""
