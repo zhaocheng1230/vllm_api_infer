@@ -258,7 +258,7 @@ output/
 配置特点：
 
 - `location /` 统一反向代理到所有 vLLM 实例
-- 一致性哈希 + keepalive 长连接
+- `least_conn` 负载均衡：把请求发到当前活跃连接最少的实例，避免单机批量推理时流量集中到某一个端口
 - `proxy_buffering off`，支持 SSE 流式输出
 - 读写超时 1800s，连接超时 30s
 - 后端故障自动切换
@@ -297,6 +297,7 @@ curl --noproxy '*' http://localhost:1358/v1/chat/completions \
 - `start_server.sh start` 检测到已存在存活的 vLLM 实例时会拒绝启动，需先执行 `stop`，避免旧进程失去 PID 跟踪。
 - `start_server.sh stop` 会先发送 SIGTERM，等待最多 30s；仍未退出的 vLLM 进程会被强制结束，Nginx 最多等待 10s。
 - 端口被占用时，对应 vLLM 实例会被跳过并输出 WARN，不影响其他实例。
+- Nginx 使用 `least_conn` 负载均衡，适合单机异步批量推理；如果仍出现某个实例明显空闲，可检查客户端是否只建立了单一长连接，或尝试降低 `keepalive` 数量。
 - 部分实例健康检查超时只会输出 WARN，请查看 `logs/` 下的日志定位原因。
 - `STOP_AFTER=1` 时，无论推理成功还是失败，脚本退出前都会停止 vLLM 与 Nginx。
 - `--resume` 依据 `.txt` 行数与输入行数是否一致判断，若中途失败较多，建议先删除对应输出后重跑。

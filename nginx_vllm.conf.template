@@ -15,8 +15,8 @@ http {
                            '$status $upstream_addr $request_time $upstream_response_time';
 
     upstream vllm_backend {
-        # ✅ 一致性哈希解决keepalive流量倾斜 (Nginx ≥1.19.8)
-        hash $request_id consistent;
+        # least_conn：将请求发到当前活跃连接最少的实例，避免单机批量推理流量倾斜
+        least_conn;
 
 {{UPSTREAM_SERVERS}}
 

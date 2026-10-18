@@ -22,6 +22,9 @@ NGINX_CONF="/tmp/nginx_vllm.conf"
 NGINX_ERROR_LOG="/tmp/nginx_vllm_error.log"
 NGINX_ACCESS_LOG="/tmp/nginx_vllm_access.log"
 
+# 默认后端：优先读取 DEVICE_BACKEND，未设置则自动检测，默认值为 auto，可选项npu|gpu
+DEFAULT_BACKEND="${DEVICE_BACKEND:-auto}"
+
 # ========================== 工具函数 ==========================
 
 log_info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
@@ -64,23 +67,30 @@ detect_vllm_ports() {
     printf "%s" "$ports" | sort -n | uniq
 }
 
-detect_device_backend() {
-    local requested
-    requested=$(echo "${DEVICE_BACKEND:-auto}" | tr '[:upper:]' '[:lower:]')
-    if [ "$requested" != "auto" ]; then
-        echo "$requested"
-        return
+# 自动检测或显式校验后端，stdout 输出 npu|gpu
+resolve_backend() {
+    local backend
+    backend=$(echo "$DEFAULT_BACKEND" | tr '[:upper:]' '[:lower:]')
+
+    if [ "$backend" = "auto" ]; then
+        if command -v npu-smi >/dev/null 2>&1 && npu-smi info -l 2>/dev/null | grep -q "NPU ID"; then
+            backend="npu"
+        elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q 'GPU [0-9]'; then
+            backend="gpu"
+        else
+            log_err "未检测到 NPU 或 GPU，请设置 DEVICE_BACKEND=npu|gpu"
+            exit 1
+        fi
+    elif [ "$backend" != "npu" ] && [ "$backend" != "gpu" ]; then
+        log_err "DEVICE_BACKEND 必须是 auto|npu|gpu，当前: $DEFAULT_BACKEND"
+        exit 1
     fi
-    if command -v npu-smi >/dev/null 2>&1 && npu-smi info -l 2>/dev/null | grep -q "NPU ID"; then
-        echo "npu"
-    elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q 'GPU [0-9]'; then
-        echo "gpu"
-    else
-        echo "unknown"
-    fi
+
+    echo "$backend"
 }
 
-count_devices() {
+# 根据后端统计可用设备数
+backend_device_count() {
     local backend="$1"
     case "$backend" in
         npu) npu-smi info -l 2>/dev/null | grep -c "NPU ID" || true ;;
@@ -89,10 +99,119 @@ count_devices() {
     esac
 }
 
+# 根据后端和可见性环境变量生成设备 ID 列表
+# 结果写入全局变量 DEVICE_TOTAL 和 DEVICE_IDS
+device_ids_for_backend() {
+    local backend="$1"
+    local detected
+    detected=$(backend_device_count "$backend")
+
+    if [ -n "${DEVICE_COUNT:-}" ] && ! [[ "$DEVICE_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+        log_err "DEVICE_COUNT 必须是正整数: $DEVICE_COUNT"
+        exit 1
+    fi
+    if [ -z "${DEVICE_COUNT:-}" ] && { ! [[ "$detected" =~ ^[0-9]+$ ]] || [ "$detected" -le 0 ]; }; then
+        log_err "设备数量无效: $detected (backend=$backend)，可通过 DEVICE_COUNT 覆盖"
+        exit 1
+    fi
+
+    local -a ids=()
+    local visible=""
+    case "$backend" in
+        gpu) visible="${CUDA_VISIBLE_DEVICES:-}" ;;
+        npu) visible="${ASCEND_RT_VISIBLE_DEVICES:-}" ;;
+    esac
+    visible=$(echo "$visible" | tr -d ' ')
+
+    local d
+    if [ -n "$visible" ] && [ "$visible" != "all" ]; then
+        IFS=',' read -ra ids <<< "$visible"
+    else
+        local fallback="$detected"
+        if ! [[ "$fallback" =~ ^[0-9]+$ ]] || [ "$fallback" -le 0 ]; then
+            fallback="${DEVICE_COUNT:-0}"
+        fi
+        for ((d = 0; d < fallback; d++)); do
+            ids+=("$d")
+        done
+    fi
+
+    local total=${#ids[@]}
+    if [ -n "${DEVICE_COUNT:-}" ]; then
+        if [ "$DEVICE_COUNT" -gt "$total" ]; then
+            log_err "DEVICE_COUNT=$DEVICE_COUNT 超过可用设备数 $total"
+            exit 1
+        fi
+        total="$DEVICE_COUNT"
+        ids=("${ids[@]:0:$total}")
+    fi
+
+    if [ "$total" -le 0 ]; then
+        log_err "无可用设备 (backend=$backend)"
+        exit 1
+    fi
+
+    DEVICE_TOTAL=$total
+    DEVICE_IDS=("${ids[@]}")
+}
+
+# 设置后端相关的进程级环境变量
+export_backend_env() {
+    local backend="$1"
+    local devices="$2"
+
+    export VLLM_NO_USAGE_STATS=1
+    export OTEL_SDK_DISABLED=true
+    export VLLM_LOGGING_LEVEL=WARNING
+
+    case "$backend" in
+        npu)
+            export ASCEND_RT_VISIBLE_DEVICES="${devices}"
+            export TASK_QUEUE_ENABLE=1
+            export COMBINED_ENABLE=1
+            export ASCEND_SLOG_PRINT_TO_STDOUT=0
+            ;;
+        gpu)
+            export CUDA_VISIBLE_DEVICES="${devices}"
+            ;;
+    esac
+}
+
+# 根据后端和 TP 返回显存利用率
+backend_memory_util() {
+    local backend="$1"
+    local tp="$2"
+
+    if [ "$backend" = "gpu" ]; then
+        echo "${VLLM_GPU_MEM_UTIL:-0.90}"
+        return
+    fi
+
+    case "$tp" in
+        1) echo 0.92 ;;
+        2) echo 0.95 ;;
+        4) echo 0.93 ;;
+        8) echo 0.90 ;;
+        *) echo 0.95 ;;
+    esac
+}
+
+# 根据后端返回默认 dtype
+backend_dtype() {
+    local backend="$1"
+
+    if [ -n "${VLLM_DTYPE:-}" ]; then
+        echo "$VLLM_DTYPE"
+    elif [ "$backend" = "gpu" ]; then
+        echo "auto"
+    else
+        echo "bfloat16"
+    fi
+}
+
 # --- 基线参数查表（按 TP 档位） ---
 tp_lookup() {
     local tp=$1
-    local backend=${2:-npu}
     case $tp in
         1) MAX_NUM_SEQS=128; MAX_BATCHED_TOKENS=32768; EXTRA_CHUNKED_ARGS="" ;;
         2) MAX_NUM_SEQS=128; MAX_BATCHED_TOKENS=16384; EXTRA_CHUNKED_ARGS="--max-num-partial-prefills 1" ;;
@@ -100,19 +219,6 @@ tp_lookup() {
         8) MAX_NUM_SEQS=64;  MAX_BATCHED_TOKENS=65536; EXTRA_CHUNKED_ARGS="--max-num-partial-prefills 1" ;;
         *) MAX_NUM_SEQS=128; MAX_BATCHED_TOKENS=16384; EXTRA_CHUNKED_ARGS="" ;;
     esac
-
-    if [ "$backend" = "gpu" ]; then
-        # GPU 默认留出更多余量，避免 CUDA context / 碎片导致 OOM
-        GPU_MEM_UTIL="${VLLM_GPU_MEM_UTIL:-0.90}"
-    else
-        case $tp in
-            1) GPU_MEM_UTIL=0.92 ;;
-            2) GPU_MEM_UTIL=0.95 ;;
-            4) GPU_MEM_UTIL=0.93 ;;
-            8) GPU_MEM_UTIL=0.90 ;;
-            *) GPU_MEM_UTIL=0.95 ;;
-        esac
-    fi
 }
 
 # ========================== start 命令 ==========================
@@ -131,65 +237,16 @@ do_start() {
         exit 1
     fi
 
-    # 检测设备后端（DEVICE_BACKEND=auto|npu|gpu）
+    # 1) 后端识别
     local BACKEND
-    BACKEND=$(detect_device_backend)
-    if [ "$BACKEND" != "npu" ] && [ "$BACKEND" != "gpu" ]; then
-        log_err "未检测到 NPU 或 GPU，请设置 DEVICE_BACKEND=npu|gpu"
-        exit 1
-    fi
+    BACKEND=$(resolve_backend)
 
-    local DETECTED_TOTAL
-    DETECTED_TOTAL=$(count_devices "$BACKEND")
-
-    if [ -n "${DEVICE_COUNT:-}" ] && ! [[ "$DEVICE_COUNT" =~ ^[1-9][0-9]*$ ]]; then
-        log_err "DEVICE_COUNT 必须是正整数: $DEVICE_COUNT"
-        exit 1
-    fi
-    if [ -z "${DEVICE_COUNT:-}" ] && { ! [[ "$DETECTED_TOTAL" =~ ^[0-9]+$ ]] || [ "$DETECTED_TOTAL" -le 0 ]; }; then
-        log_err "设备数量无效: $DETECTED_TOTAL (backend=$BACKEND)，可通过 DEVICE_COUNT 覆盖"
-        exit 1
-    fi
-
-    # 设备 ID 列表：优先复用已有的 CUDA_VISIBLE_DEVICES / ASCEND_RT_VISIBLE_DEVICES
+    # 2) 设备列表解析
+    local DEVICE_TOTAL
     local -a DEVICE_IDS=()
-    local visible_env=""
-    if [ "$BACKEND" = "gpu" ]; then
-        visible_env="${CUDA_VISIBLE_DEVICES:-}"
-    else
-        visible_env="${ASCEND_RT_VISIBLE_DEVICES:-}"
-    fi
-    visible_env=$(echo "$visible_env" | tr -d ' ')
+    device_ids_for_backend "$BACKEND"
 
-    local d
-    if [ -n "$visible_env" ] && [ "$visible_env" != "all" ]; then
-        IFS=',' read -ra DEVICE_IDS <<< "$visible_env"
-    else
-        local fallback_total="$DETECTED_TOTAL"
-        if ! [[ "$fallback_total" =~ ^[0-9]+$ ]] || [ "$fallback_total" -le 0 ]; then
-            fallback_total="${DEVICE_COUNT:-0}"
-        fi
-        for ((d = 0; d < fallback_total; d++)); do
-            DEVICE_IDS+=("$d")
-        done
-    fi
-
-    local DEVICE_TOTAL=${#DEVICE_IDS[@]}
-    if [ -n "${DEVICE_COUNT:-}" ]; then
-        if [ "$DEVICE_COUNT" -gt "$DEVICE_TOTAL" ]; then
-            log_err "DEVICE_COUNT=$DEVICE_COUNT 超过可用设备数 $DEVICE_TOTAL"
-            exit 1
-        fi
-        DEVICE_TOTAL="$DEVICE_COUNT"
-        DEVICE_IDS=("${DEVICE_IDS[@]:0:$DEVICE_TOTAL}")
-    fi
-
-    if [ "$DEVICE_TOTAL" -le 0 ]; then
-        log_err "无可用设备 (backend=$BACKEND)"
-        exit 1
-    fi
     local LOOP_COUNT=$((DEVICE_TOTAL / TP_SIZE))
-
     [ "$LOOP_COUNT" -le 0 ] && { log_err "设备不足: total=$DEVICE_TOTAL, per_model=$TP_SIZE"; exit 1; }
 
     mkdir -p "$TASK_LOG_DIR"
@@ -207,20 +264,15 @@ do_start() {
     fi
     > "$PID_FILE"
 
-    # --- 基线参数查表 ---
+    # 3) 基线参数
     local GPU_MEM_UTIL MAX_NUM_SEQS MAX_BATCHED_TOKENS EXTRA_CHUNKED_ARGS
-    tp_lookup "$TP_SIZE" "$BACKEND"
+    tp_lookup "$TP_SIZE"
+    GPU_MEM_UTIL=$(backend_memory_util "$BACKEND" "$TP_SIZE")
 
     local DTYPE
-    if [ -n "${VLLM_DTYPE:-}" ]; then
-        DTYPE="$VLLM_DTYPE"
-    elif [ "$BACKEND" = "gpu" ]; then
-        DTYPE="auto"
-    else
-        DTYPE="bfloat16"
-    fi
+    DTYPE=$(backend_dtype "$BACKEND")
 
-    # --- 模型特殊参数 ---
+    # 4) 模型特殊参数
     local EXTRA_VLLM_ARGS=""
     local TOOL_CALL_PARSER="hermes"
 
@@ -271,18 +323,7 @@ do_start() {
 
         # 在子 shell 中设置设备相关环境变量，exec 后 PID 即为 vllm 进程
         (
-            export VLLM_NO_USAGE_STATS=1
-            export OTEL_SDK_DISABLED=true
-            export VLLM_LOGGING_LEVEL=WARNING
-
-            if [ "$BACKEND" = "npu" ]; then
-                export ASCEND_RT_VISIBLE_DEVICES="${CURRENT_DEVICES}"
-                export TASK_QUEUE_ENABLE=1
-                export COMBINED_ENABLE=1
-                export ASCEND_SLOG_PRINT_TO_STDOUT=0
-            else
-                export CUDA_VISIBLE_DEVICES="${CURRENT_DEVICES}"
-            fi
+            export_backend_env "$BACKEND" "$CURRENT_DEVICES"
 
             exec vllm serve "${MODEL_PATH}" \
                 --host 0.0.0.0 \
@@ -376,6 +417,7 @@ do_nginx() {
     ' "$NGINX_CONF" > "$tmp_conf" && mv "$tmp_conf" "$NGINX_CONF"
 
     echo "已生成 ${NGINX_CONF} (监听端口: ${listen_port}, 后端实例: ${port_count})"
+    log_info "Nginx 使用 least_conn 负载均衡策略"
 
     # 停止旧进程 → 验证 → 启动/重载
     if [ -f "$NGINX_PID" ] && kill -0 "$(cat "$NGINX_PID" 2>/dev/null)" 2>/dev/null; then
@@ -517,18 +559,20 @@ do_stop() {
 
 # ========================== 主入口 ==========================
 
-case "${1:-}" in
-    start)  shift; do_start "$@" ;;
-    nginx)  shift; do_nginx "$@" ;;
-    status) do_status ;;
-    stop)   do_stop ;;
-    *)
-        echo "用法: bash $0 {start|nginx|status|stop}"
-        echo ""
-        echo "  start  <model_path> <model_name> <tp_size> [max_model_len]"
-        echo "  nginx  [listen_port]          # 默认 1358"
-        echo "  status                        # 查看运行状态"
-        echo "  stop                          # 停止所有服务"
-        exit 1
-        ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    case "${1:-}" in
+        start)  shift; do_start "$@" ;;
+        nginx)  shift; do_nginx "$@" ;;
+        status) do_status ;;
+        stop)   do_stop ;;
+        *)
+            echo "用法: bash $0 {start|nginx|status|stop}"
+            echo ""
+            echo "  start  <model_path> <model_name> <tp_size> [max_model_len]"
+            echo "  nginx  [listen_port]          # 默认 1358"
+            echo "  status                        # 查看运行状态"
+            echo "  stop                          # 停止所有服务"
+            exit 1
+            ;;
+    esac
+fi
