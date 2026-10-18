@@ -162,7 +162,8 @@ export_backend_env() {
 
     export VLLM_NO_USAGE_STATS=1
     export OTEL_SDK_DISABLED=true
-    export VLLM_LOGGING_LEVEL=WARNING
+    # INFO 才会输出周期性吞吐 / KV cache / prefix cache 统计；WARNING 可让日志更安静
+    export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
 
     case "$backend" in
         npu)
@@ -386,6 +387,13 @@ do_start() {
 do_nginx() {
     local listen_port="${1:-1358}"
     local template_file="$(dirname "$0")/nginx_vllm.conf.template"
+
+    if ! command -v nginx >/dev/null 2>&1; then
+        log_err "未找到 nginx 命令，请先安装 Nginx 或将其加入 PATH"
+        log_err "  Debian/Ubuntu: sudo apt-get install -y nginx"
+        log_err "  RHEL/CentOS:   sudo yum install -y nginx"
+        exit 1
+    fi
 
     [ -f "$template_file" ] || { log_err "模板文件不存在: ${template_file}"; exit 1; }
 

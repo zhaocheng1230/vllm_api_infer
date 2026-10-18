@@ -159,6 +159,7 @@ python vllm_infer.py \
 | `DEVICE_COUNT` | 自动检测 | 覆盖设备数量 |
 | `VLLM_GPU_MEM_UTIL` | `0.90` | GPU 显存利用率 |
 | `VLLM_DTYPE` | GPU 为 `auto`，NPU 为 `bfloat16` | 覆盖 dtype |
+| `VLLM_LOGGING_LEVEL` | `INFO` | vLLM 日志级别；`INFO` 输出周期性吞吐/KV cache 统计，`WARNING` 更安静 |
 
 示例：
 
