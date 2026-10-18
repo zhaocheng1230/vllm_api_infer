@@ -118,7 +118,7 @@ NPU 默认参数：
 bash start_server.sh start <model_path> <model_name> <tp_size> [date_str] [max_model_len]
 
 # 启动/重载 Nginx（默认监听 1358；缺省自动识别最近启动的任务）
-bash start_server.sh nginx [listen_port] [date_str] [model_name]
+bash start_server.sh nginx [listen_port] [model_name] [date_str]
 
 # 查看状态：指定任务或查看全部任务
 bash start_server.sh status [model_name] [date_str]
