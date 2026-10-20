@@ -21,3 +21,12 @@ export CONCURRENCY=64
 export STOP_AFTER=1
 
 bash run_pipeline.sh
+
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.5-4B",
+    "messages": [{"role":"user","content":"你好，简单介绍一下你自己"}],
+    "max_tokens": 64,
+    "temperature": 0.6
+  }'

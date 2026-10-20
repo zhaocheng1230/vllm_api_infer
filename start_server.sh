@@ -90,8 +90,9 @@ detect_vllm_ports() {
         while read -r pid; do
             [ -z "$pid" ] && continue
             if kill -0 "$pid" 2>/dev/null; then
+                # 用 ss + awk 提取端口，避免 ps 截断和 grep -P 兼容性问题
                 local p
-                p=$(ps -p "$pid" -o args= 2>/dev/null | grep -oP '(?<=--port )\d+' || true)
+                p=$(ss -tlnp 2>/dev/null | awk -v pid="pid=${pid}," '$0 ~ pid {split($4, a, ":"); print a[length(a)]}' | head -1)
                 [ -n "$p" ] && ports="${ports}${p}"$'\n'
             fi
         done < "$pid_file"
@@ -201,9 +202,14 @@ export_backend_env() {
     case "$backend" in
         npu)
             export ASCEND_RT_VISIBLE_DEVICES="${devices}"
+            
+            # 👇 新增：从官方脚本借鉴的通用优化
+            export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+            export OMP_NUM_THREADS=1
             export TASK_QUEUE_ENABLE=1
-            export COMBINED_ENABLE=1
-            export ASCEND_SLOG_PRINT_TO_STDOUT=0
+
+            export VLLM_WORKER_MULTIPROC_METHOD=spawn
+            export VLLM_TARGET_DEVICE=ascend
             ;;
         gpu)
             export CUDA_VISIBLE_DEVICES="${devices}"
@@ -377,8 +383,7 @@ do_start() {
                 --max-num-batched-tokens "${MAX_BATCHED_TOKENS}" \
                 ${EXTRA_CHUNKED_ARGS} \
                 --trust-remote-code \
-                --enable-prefix-caching \
-                --enable-chunked-prefill \
+                --async-scheduling \
                 --enable-auto-tool-choice \
                 --tool-call-parser "${TOOL_CALL_PARSER}" \
                 ${EXTRA_VLLM_ARGS} \

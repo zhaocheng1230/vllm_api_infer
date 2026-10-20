@@ -85,19 +85,25 @@ class VLLMInfer:
         self.client_async = None
 
     def init_client_async(self):
-        """在当前事件循环内初始化异步 OpenAI 客户端"""
+        """初始化异步OpenAI客户端，匹配Nginx/vLLM服务端配置"""
         if self.client_async is None:
+            import httpx
             self.client_async = AsyncOpenAI(
                 api_key=self.args.key,
                 base_url=self.args.host,
-                max_retries=2,
-                timeout=httpx.Timeout(1800.0, connect=30.0),
+                max_retries=3,  # ← 从2提升到3，增加网络抖动容错
+                timeout=httpx.Timeout(
+                    connect=30.0,
+                    read=1800.0,
+                    write=60.0,
+                    pool=120.0  # ← 从60s提升到120s，给连接池更多等待时间
+                ),
                 http_client=httpx.AsyncClient(
                     limits=httpx.Limits(
-                        max_connections=150,
-                        max_keepalive_connections=128,
+                        max_connections=512,
+                        max_keepalive_connections=512
                     )
-                ),
+                )
             )
 
     @staticmethod
