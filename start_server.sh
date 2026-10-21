@@ -93,6 +93,10 @@ detect_vllm_ports() {
                 # 用 ss + awk 提取端口，避免 ps 截断和 grep -P 兼容性问题
                 local p
                 p=$(ss -tlnp 2>/dev/null | awk -v pid="pid=${pid}," '$0 ~ pid {split($4, a, ":"); print a[length(a)]}' | head -1)
+                # ss 不可用 / 看不到别的用户的进程时，回退到 ps
+                if [ -z "$p" ]; then
+                    p=$(ps -p "$pid" -o args= 2>/dev/null | grep -oP '(?<=--port )\d+' | head -1 || true)
+                fi
                 [ -n "$p" ] && ports="${ports}${p}"$'\n'
             fi
         done < "$pid_file"
@@ -350,6 +354,15 @@ do_start() {
     echo "  max-num-seqs:   $MAX_NUM_SEQS"
     echo "  batched-tokens: $MAX_BATCHED_TOKENS"
     echo "  extra-chunked:  ${EXTRA_CHUNKED_ARGS:-(none)}"
+    echo "  建议客户端并发: $((LOOP_COUNT * MAX_NUM_SEQS))"
+    echo "  --- 参数建议 ---"
+    echo "  CONCURRENCY 依次试 $((LOOP_COUNT * MAX_NUM_SEQS / 4)) / $((LOOP_COUNT * MAX_NUM_SEQS / 2)) / $((LOOP_COUNT * MAX_NUM_SEQS))，用 bench.py 逐档比"
+    if [ "$MAX_BATCHED_TOKENS" -lt "$MAX_MODEL_LEN" ]; then
+        echo "  注意: max-num-batched-tokens($MAX_BATCHED_TOKENS) < MAX_MODEL_LEN($MAX_MODEL_LEN)"
+        echo "        保持 chunked prefill 开启；若手动关闭，vLLM 启动即报错"
+    fi
+    echo "  注意: --async-scheduling 提吞吐但会拉高 TTFT，吞吐和 TTFT 一起看"
+    echo "  编译缓存: ${VLLM_CACHE_BASE:-$HOME/.cache/vllm_multi}/<模型>/<端口>  （每实例独立，避免多实例并发写冲突）"
     echo "========================================="
 
     for i in $(seq 0 $((LOOP_COUNT - 1))); do
@@ -366,10 +379,20 @@ do_start() {
         local LOG_FILE="${TASK_LOG_DIR}/vllm_${TIMESTAMP}_${CURRENT_PORT}.log"
 
         echo "正在启动任务 $i: 设备 [${CURRENT_DEVICES}], 端口 [${CURRENT_PORT}], 日志 [${LOG_FILE}]..."
+        echo "  编译缓存: ${VLLM_CACHE_BASE:-$HOME/.cache/vllm_multi}/${MODEL_DIR}/${CURRENT_PORT}"
 
         # 在子 shell 中设置设备相关环境变量，exec 后 PID 即为 vllm 进程
         (
             export_backend_env "$BACKEND" "$CURRENT_DEVICES"
+
+            # 每个实例用独立的编译缓存目录。
+            # vLLM 的缓存路径是 <VLLM_CACHE_ROOT>/torch_compile_cache/<hash>/rank_{rank}_{dp_rank}，
+            # 多实例同模型同配置时 rank 都是 0_0 -> 写同一个文件。
+            # 冷启动时多实例并发编译同一个 kernel 会互相覆盖，导致
+            # "Compiling model again due to a load failure" 警告并多花几十秒重编。
+            export VLLM_CACHE_ROOT="${VLLM_CACHE_BASE:-$HOME/.cache/vllm_multi}/${MODEL_DIR}/${CURRENT_PORT}"
+            export TRITON_CACHE_DIR="${VLLM_CACHE_ROOT}/triton"
+            mkdir -p "${VLLM_CACHE_ROOT}"
 
             exec vllm serve "${MODEL_PATH}" \
                 --host 0.0.0.0 \

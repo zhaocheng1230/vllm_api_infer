@@ -88,6 +88,10 @@ class VLLMInfer:
         """初始化异步OpenAI客户端，匹配Nginx/vLLM服务端配置"""
         if self.client_async is None:
             import httpx
+            # 连接池上限必须 >= 并发数。否则超出部分的请求会在 httpx 内部排队，
+            # 表现就是"把 --concurrency 调大却没反应"。
+            # 写死数值（150 / 512）只是把天花板挪了个位置，这里跟着并发走。
+            pool_size = max(512, self.args.concurrency + 32)
             self.client_async = AsyncOpenAI(
                 api_key=self.args.key,
                 base_url=self.args.host,
@@ -100,8 +104,8 @@ class VLLMInfer:
                 ),
                 http_client=httpx.AsyncClient(
                     limits=httpx.Limits(
-                        max_connections=512,
-                        max_keepalive_connections=512
+                        max_connections=pool_size,
+                        max_keepalive_connections=pool_size
                     )
                 )
             )
@@ -117,8 +121,13 @@ class VLLMInfer:
                 if isinstance(val, (str, list)):
                     return val
                 return str(val)
-        for v in item.values():
-            if isinstance(v, str):
+        # 兜底：跳过 id / answer 这类元数据字段，别把它们当 prompt 发出去
+        meta_keys = {"id", "_id", "idx", "index", "uid", "answer", "answers",
+                     "label", "labels", "target", "gt", "solution", "reason"}
+        for k, v in item.items():
+            if k in meta_keys:
+                continue
+            if isinstance(v, str) and v.strip():
                 return v
         return json.dumps(item, ensure_ascii=False)
 
@@ -144,6 +153,7 @@ class VLLMInfer:
         first_token_time = None
         output_tokens = 0
         prompt_tokens = 0
+        finish_reason = None
 
         start_time = time.perf_counter()
         async for chunk in stream:
@@ -151,16 +161,28 @@ class VLLMInfer:
                 output_tokens = chunk.usage.completion_tokens or output_tokens
                 prompt_tokens = chunk.usage.prompt_tokens or prompt_tokens
 
-            if chunk.choices and chunk.choices[0].delta.content:
-                if first_token_time is None:
-                    first_token_time = time.perf_counter()
-                collected_content.append(chunk.choices[0].delta.content)
+            if chunk.choices:
+                if chunk.choices[0].finish_reason:
+                    finish_reason = chunk.choices[0].finish_reason
+                if chunk.choices[0].delta.content:
+                    if first_token_time is None:
+                        first_token_time = time.perf_counter()
+                    collected_content.append(chunk.choices[0].delta.content)
 
         end_time = time.perf_counter()
         total_time = end_time - start_time
 
         if output_tokens == 0 and collected_content:
             output_tokens = len(collected_content)
+
+        # 正常结束的流一定带 finish_reason（stop / length）。
+        # 缺它说明连接被中途掐断 —— nginx 后端 failover 时会产生截断流，
+        # 这时必须当失败重试，否则半截答案会被当成正确答案写进结果。
+        if finish_reason is None:
+            raise RuntimeError(
+                f"stream ended without finish_reason (truncated), "
+                f"got {output_tokens} tokens"
+            )
 
         return {
             "content": "".join(collected_content),
@@ -169,6 +191,7 @@ class VLLMInfer:
             "output_tokens": output_tokens,
             "prompt_tokens": prompt_tokens,
             "tps": output_tokens / total_time if total_time > 0 else 0,
+            "finish_reason": finish_reason,
         }
 
     async def _process_item_async(
@@ -190,7 +213,9 @@ class VLLMInfer:
         _res = None
 
         repeat = 0
+        attempts = 0
         while repeat < 3:
+            attempts += 1
             async with semaphore:
                 try:
                     self.init_client_async()
@@ -203,17 +228,14 @@ class VLLMInfer:
                     ttft = _res.get("ttft", 0.0)
                     tps = _res.get("tps", 0.0)
 
-                    if i == 0 or (i + 1) % 100 == 0:
-                        print(f">>> [Sample] idx:{i} response:{response[:100]}...")
-
                     success = True
                     break
 
                 except (openai.APIConnectionError, openai.APITimeoutError) as e:
+                    # 网络抖动值得重试：走和业务错误一样的退避路径
+                    repeat += 1
                     last_error = str(e)
-                    print(f"[Final Retry Failed] Network error for item {i}: {e}")
-                    output_time = _res.get("total_time", 0.0) if _res else 0.0
-                    break
+                    print(f"[Retry {repeat}/3] Network error for item {i}: {e}")
 
                 except Exception as e:
                     repeat += 1
@@ -223,10 +245,12 @@ class VLLMInfer:
             if not success and repeat < 3:
                 await asyncio.sleep(2 ** repeat)
 
-        print(
-            f">>> response | time:{(output_time or 0):.2f}s | "
-            f"ttft:{(ttft or 0):.3f}s | tps:{(tps or 0):.1f} | idx:{i}"
-        )
+        # 每条都 print 会在高并发下把终端 I/O 变成瓶颈，采样打印
+        if (i + 1) % 100 == 0:
+            print(
+                f">>> [{i + 1}] time:{(output_time or 0):.2f}s | "
+                f"ttft:{(ttft or 0):.3f}s | tps:{(tps or 0):.1f}"
+            )
 
         item.update({
             "output": response,
@@ -238,19 +262,20 @@ class VLLMInfer:
             "tps": tps,
             "success": success,
             "error": last_error if not success else "",
+            "attempts": attempts,
         })
         return i, item
 
     async def _run_api_call_async(
-        self, data: List[Dict[str, Any]], concurrency: int
+        self, data: List[Tuple[int, Dict[str, Any]]], concurrency: int
     ) -> List[Tuple[int, Dict[str, Any]]]:
-        """为单个文件发起全部异步请求，按完成顺序收集结果"""
+        """为给定的 (原始索引, 数据) 列表发起全部异步请求，按完成顺序收集结果"""
         self.init_client_async()
         semaphore = asyncio.Semaphore(concurrency)
 
         tasks = [
             self._process_item_async(item, i, semaphore)
-            for i, item in enumerate(data)
+            for i, item in data
         ]
 
         results = []
@@ -301,19 +326,37 @@ class VLLMInfer:
         txt_path = out_base.parent / (out_base.name + "_output.txt")
         jsonl_path = out_base.parent / (out_base.name + "_output.jsonl")
 
-        if self.args.resume and txt_path.exists():
+        # 断点续跑：读回上次结果，只重跑「没结果」和「上次失败」的条目。
+        # （原逻辑是「输出行数 == 输入行数就跳过」，但失败条目也会写一行空串，
+        #   行数永远相等 → 失败条目一次都不会重跑。）
+        prev_results: Dict[int, Dict[str, Any]] = {}
+        if self.args.resume and jsonl_path.exists():
             try:
-                out_lines = sum(1 for _ in open(txt_path, "r", encoding="utf-8"))
-                if out_lines == len(data):
-                    print(f"[Skip] 已存在完整结果: {txt_path}")
-                    return
+                with open(jsonl_path, "r", encoding="utf-8") as f:
+                    for n, line in enumerate(f):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if rec.get("success"):
+                            prev_results[n] = rec
+                if prev_results:
+                    print(f"[Resume] 复用上次成功结果 {len(prev_results)} 条")
             except Exception:
-                pass
+                prev_results = {}
 
+        todo = [(i, it) for i, it in enumerate(data) if i not in prev_results]
         results = asyncio.run(
-            self._run_api_call_async(data, self.args.concurrency)
+            self._run_api_call_async(todo, self.args.concurrency)
         )
-        results.sort(key=lambda x: x[0])
+        # 合并上次成功的结果
+        merged = dict(prev_results)
+        for idx, item in results:
+            merged[idx] = item
+        results = [(i, merged[i]) for i in sorted(merged)]
 
         with open(txt_path, "w", encoding="utf-8") as ftxt:
             if self.args.save_jsonl:
