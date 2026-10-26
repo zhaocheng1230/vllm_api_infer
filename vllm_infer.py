@@ -2,11 +2,14 @@
 # vllm_infer.py - 异步批量调用本地 vLLM/Nginx 服务，为 jsonl 文件生成 output
 # 用法:
 #   python vllm_infer.py \
-#       --input_dir ./data \
+#       --input ./datasets/gsm8k_zh.jsonl \
 #       --output_dir ./output \
 #       --host http://localhost:1358/v1 \
 #       --model MyModel \
 #       --concurrency 64
+#
+# --input 传具体的 jsonl 文件路径（推荐）。
+# --input_dir 是旧的目录扫描模式，已弃用。
 
 import argparse
 import asyncio
@@ -50,8 +53,12 @@ def parse_args():
     project_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="vLLM 异步批量推理客户端")
     parser.add_argument(
-        "--input_dir", default=str(project_dir / "datasets"),
-        help="输入 jsonl 文件所在目录（默认 <项目>/datasets）",
+        "--input", default=None,
+        help="输入 jsonl 文件路径（推荐）。benchmark 模式由配置文档直接给出",
+    )
+    parser.add_argument(
+        "--input_dir", default=None,
+        help="[已弃用] 输入目录，扫描其中的 *.jsonl。请改用 --input 指定具体文件",
     )
     parser.add_argument(
         "--output_dir", default=str(project_dir / "output"),
@@ -83,6 +90,9 @@ class VLLMInfer:
     def __init__(self, args):
         self.args = args
         self.client_async = None
+        self.input_base = Path(".")  # 输入文件相对输出目录的基准路径，run() 里赋值
+        self.total_count = 0
+        self.success_count = 0
 
     def init_client_async(self):
         """初始化异步OpenAI客户端，匹配Nginx/vLLM服务端配置"""
@@ -191,7 +201,6 @@ class VLLMInfer:
             "output_tokens": output_tokens,
             "prompt_tokens": prompt_tokens,
             "tps": output_tokens / total_time if total_time > 0 else 0,
-            "finish_reason": finish_reason,
         }
 
     async def _process_item_async(
@@ -319,7 +328,7 @@ class VLLMInfer:
             print("[Warn] 空文件，跳过")
             return
 
-        rel = input_path.relative_to(Path(self.args.input_dir))
+        rel = input_path.relative_to(self.input_base)
         out_base = output_dir / rel.with_suffix("")
         out_base.parent.mkdir(parents=True, exist_ok=True)
 
@@ -388,31 +397,61 @@ class VLLMInfer:
             f"failed={failed_count}, avg_tps={avg_tps:.1f}"
         )
 
+        # 累加给 run() 做全局判断
+        self.total_count += len(results)
+        self.success_count += success_count
+
     def run(self):
-        input_dir = Path(self.args.input_dir)
         output_dir = Path(self.args.output_dir)
 
-        if not input_dir.exists():
-            print(f"[Error] 输入目录不存在: {input_dir}")
+        # 输入解析：优先「具体 jsonl 文件」，目录扫描是旧的测试用逻辑，已弃用。
+        raw_input = self.args.input or self.args.input_dir
+        if not raw_input:
+            raw_input = str(Path(__file__).resolve().parent / "datasets")
+
+        input_path = Path(raw_input)
+        if not input_path.exists():
+            print(f"[Error] 输入路径不存在: {input_path}")
             sys.exit(1)
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        pattern = "**/*.jsonl" if self.args.recursive else "*.jsonl"
-        output_resolved = output_dir.resolve()
-        files = [
-            fp for fp in sorted(input_dir.glob(pattern))
-            if output_resolved not in fp.resolve().parents
-        ]
-        if not files:
-            print(f"[Warn] 未找到 .jsonl 文件: {input_dir}")
-            return
+        if input_path.is_file():
+            # 新逻辑：路径唯一，直接读这个文件，不扫描目录
+            base_dir = input_path.parent
+            files = [input_path]
+        else:
+            # 兼容旧逻辑：目录扫描（已弃用）
+            print("[Deprecate] 目录扫描模式已弃用，请用 --input 指定具体 jsonl 文件")
+            base_dir = input_path
+            pattern = "**/*.jsonl" if self.args.recursive else "*.jsonl"
+            output_resolved = output_dir.resolve()
+            files = [
+                fp for fp in sorted(input_path.glob(pattern))
+                if output_resolved not in fp.resolve().parents
+            ]
 
+        if not files:
+            # 之前这里是 [Warn] + return，退出码 0 -> 上层会误判成「跑成功了」。
+            # 找不到输入文件必须让整条管道失败。
+            print(f"[Error] 未找到 .jsonl 文件: {input_path}")
+            sys.exit(1)
+
+        self.input_base = base_dir
         print(f"找到 {len(files)} 个输入文件，输出目录: {output_dir}")
         for fp in files:
             self._process_file(fp, output_dir)
 
         print("\n[All Done]")
+
+        # 全军覆没 = 服务/网络/参数出了系统性问题，不能当成跑成功。
+        # 部分失败是正常的（个别条目出错），不因此中断。
+        if self.total_count > 0 and self.success_count == 0:
+            print(
+                f"[Error] {self.total_count} 条全部失败，成功 0 条 —— "
+                f"这不是正常结果，退出码置 1 以免上层误判成「跑成功」"
+            )
+            sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,53 @@
+{
+  "_readme": [
+    "benchmark 配置文档。每个顶层键 = 一个 benchmark 名。",
+    "新增 benchmark 只需要在这里加一节，不用改任何代码。",
+    "",
+    "dataset.input_file  : 该 benchmark 唯一的数据集文件路径（直接读这个文件，不扫描目录）",
+    "dataset.output_dir : 产出目录",
+    "server 段  : vLLM 服务端启动参数。指纹相同 = 可复用同一个服务实例（不重启）",
+    "client 段  : vllm_infer.py 的命令行参数名（去掉 --），直接透传",
+    "             特殊键 system_prompt_file: 文件路径，内容会作为 --system_prompt 传入",
+    "",
+    "运行: bash run_pipeline.sh --benchmarks gpqa,gsm8k_zh"
+  ],
+
+  "gpqa": {
+    "dataset": {
+      "input_file": "./datasets/gpqa.jsonl",
+      "output_dir": "./output/gpqa"
+    },
+    "server": {
+      "max_model_len": 8192,
+      "max_num_seqs": 64,
+      "max_num_batched_tokens": 32768
+    },
+    "client": {
+      "max_tokens": 4096,
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "presence_penalty": 0.0,
+      "system_prompt_file": null
+    }
+  },
+
+  "gsm8k_zh": {
+    "dataset": {
+      "input_file": "./datasets/gsm8k_zh.jsonl",
+      "output_dir": "./output/gsm8k_zh"
+    },
+    "server": {
+      "max_model_len": 4096,
+      "max_num_seqs": 128,
+      "max_num_batched_tokens": 32768
+    },
+    "client": {
+      "max_tokens": 1024,
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "presence_penalty": 0.0
+    }
+  }
+}

@@ -17,9 +17,11 @@
 ├── run_pipeline.sh              # 任务入口：启动服务 + 执行推理
 ├── nginx_vllm.conf.template     # Nginx 配置模板
 ├── .gitignore                   # 忽略运行时产物
+├── configs/benchmarks.json      # benchmark 配置文档（各数据集的专属参数）
 ├── datasets/                    # 输入目录（*.jsonl）
 ├── output/                      # 输出目录
-└── logs/<date>/<model>/         # 每个任务独立的运行状态与日志
+├── tools/conf2sh.py             # 读取 benchmark 配置（bash <-> JSON 桥）
+└── logs/<date>/<model>/<bench>/  # 每个任务独立的运行状态与日志
 ```
 
 ## 环境要求
@@ -157,12 +159,9 @@ bash start_server.sh stop "$MODEL_NAME" "$current_date"
 ### 客户端推理
 
 ```bash
-# 使用默认 datasets/ 和 output/
-python vllm_infer.py --model MyModel
-
 # 完整参数示例
 python vllm_infer.py \
-    --input_dir ./datasets \
+    --input ./datasets/gsm8k_zh.jsonl \
     --output_dir ./output \
     --host http://localhost:1358/v1 \
     --model MyModel \
@@ -208,7 +207,8 @@ bash run_pipeline.sh
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--input_dir` | `<项目>/datasets` | 输入 jsonl 目录 |
+| `--input` | `<项目>/datasets` | 输入 jsonl **文件**路径（推荐） |
+| `--input_dir` | — | **[已弃用]** 输入目录，扫描其中的 `*.jsonl`。请改用 `--input` |
 | `--output_dir` | `<项目>/output` | 输出目录 |
 | `--host` | `http://localhost:1358/v1` | OpenAI 兼容接口 base_url |
 | `--model` | 必填 | 模型名 |
@@ -228,12 +228,22 @@ bash run_pipeline.sh
 
 ### 输入
 
+推荐做法是**一个 benchmark 一个 jsonl 文件**，路径直接写在配置文档里：
+
 ```text
 datasets/
-├── group_a.jsonl
-└── subdir/
-    └── group_b.jsonl
+├── gpqa.jsonl
+└── gsm8k_zh.jsonl
 ```
+
+```json
+"dataset": { "input_file": "./datasets/gpqa.jsonl", "output_dir": "./output/gpqa" }
+```
+
+客户端收到的是**具体文件路径**，直接读，不扫描目录。
+
+> 旧的目录扫描模式（`--input_dir`，会把目录下所有 `*.jsonl` 都跑一遍）已弃用，
+> 仍能跑但会打 `[Deprecate]` 提示。
 
 ### 输出
 
@@ -319,6 +329,98 @@ curl --noproxy '*' http://localhost:1358/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"MyModel","messages":[{"role":"user","content":"你好"}]}'
 ```
+
+## Benchmark 模式（多数据集顺序跑）
+
+每个 benchmark 的参数（`max_model_len`、数据集位置、解码参数等）集中在
+**`configs/benchmarks.json`**。新增 benchmark 只需要加一节配置，**不用改任何代码**。
+
+```bash
+export MODEL_PATH=/root/private_data/models/Qwen/Qwen3.5-4B
+export MODEL_NAME=Qwen3.5-4B
+export TP_SIZE=1
+export CONCURRENCY=64
+export STOP_AFTER=1
+
+# 按顺序跑 gpqa -> gsm8k_zh
+bash run_pipeline.sh --benchmarks gpqa,gsm8k_zh
+```
+
+执行流程：
+
+```
+for 每个 benchmark:
+    读配置 -> 需要换服务端参数? 停旧服务 + 起新服务 : 复用现有服务
+    -> 跑该 benchmark 的数据集
+```
+
+- **服务端参数指纹相同**（`max_model_len` / `max_num_seqs` / `max_num_batched_tokens` 一致）
+  → **复用同一个服务实例，不重启**，省掉一次模型加载
+- 参数不同 → 停掉旧实例、起新实例（端口复用）
+- 任务日志按 benchmark 分层：`logs/<date>/<model>/<benchmark>/`
+- 每个 benchmark 的产出独立：`output/<benchmark>/`
+
+### 配置文档格式
+
+```json
+{
+  "gpqa": {
+    "dataset": { "input_file": "./datasets/gpqa.jsonl", "output_dir": "./output/gpqa" },
+    "server":  { "max_model_len": 8192, "max_num_seqs": 64,
+                 "max_num_batched_tokens": 32768 },
+    "client":  { "max_tokens": 4096, "temperature": 0.0, "top_p": 1.0,
+                 "system_prompt_file": null }
+  }
+}
+```
+
+| 段 | 说明 |
+| --- | --- |
+| `dataset.input_file` | 该 benchmark **唯一**的数据集 jsonl 路径（直接读这个文件，不扫描目录） |
+| `dataset.output_dir` | 产出目录 |
+| `server` | vLLM 服务端启动参数，**同时用于判断能否复用服务实例** |
+| `client` | `vllm_infer.py` 的命令行参数名（去掉 `--`），直接透传 |
+| `client.system_prompt_file` | 特殊键：文件路径，内容会作为 `--system_prompt` 传入 |
+
+### 并发消歧
+
+同一天、同一模型、同一 benchmark 跑多个任务时，用 `TASK_ID` 区分目录：
+
+```bash
+export TASK_ID=jobA
+bash run_pipeline.sh --benchmarks gpqa
+# -> logs/<date>/<model>/gpqa__jobA/
+```
+
+### 命令行参数
+
+| 参数 | 说明 |
+| --- | --- |
+| `--benchmarks <a,b,c>` | 按顺序跑哪些 benchmark |
+| `--conf <file>` | 配置文件路径，默认 `configs/benchmarks.json` |
+| 其余参数 | 原样透传给 `vllm_infer.py` |
+
+查看配置里有哪些 benchmark：
+
+```bash
+python3 tools/conf2sh.py configs/benchmarks.json --list
+```
+
+### 失败会明确报出来（不会「假成功」）
+
+| 情况 | 行为 |
+| --- | --- |
+| 配置里的数据集文件不存在 | 启动服务**之前**就报错退出（退出码 1） |
+| 客户端版本过旧（不支持 `--input`） | 开跑前拦下来，并提示更新 |
+| 客户端一个输入文件都没找到 | `[Error]` + 退出码 1 |
+| 客户端所有条目全部失败 | `[Error] N 条全部失败` + 退出码 1 |
+| 个别条目失败 | 正常退出，`[Summary]` 里能看到 failed 数 |
+
+任何一个 benchmark 失败，**整条流水线立刻中止**，不会继续跑后面的、也不会打印「全部 benchmark 完成」。
+
+> ⚠️ 升级客户端时务必把 `vllm_infer.py` 一起换掉。旧版只有 `--input_dir`，
+> 而 `--input` 是 `--input_dir` 的前缀，argparse 会把 `--input` **静默绑到**
+> `--input_dir` 上，表现为「找不到文件」但退出码 0。新版会提前检测并拦下。
 
 ## 注意事项
 

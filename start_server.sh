@@ -26,6 +26,7 @@ DEFAULT_DATE_STR="${DATE_STR:-$(date +%Y%m%d)}"
 # 任务相关路径，由 set_task_paths() 填充
 DATE_STR="$DEFAULT_DATE_STR"
 MODEL_DIR=""
+BENCH_DIR=""
 TASK_LOG_DIR=""
 PID_FILE=""
 NGINX_PID=""
@@ -48,11 +49,24 @@ log_err()  { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; }
 set_task_paths() {
     local date_str="${1:-$DEFAULT_DATE_STR}"
     local model_name="${2:-}"
+    local bench_name="${3:-${BENCHMARK:-}}"
     [ -n "$model_name" ] || { log_err "缺少 model_name"; exit 1; }
 
     DATE_STR="$date_str"
     MODEL_DIR="${model_name//\//_}"
-    TASK_LOG_DIR="${BASE_LOG_DIR}/${DATE_STR}/${MODEL_DIR}"
+    BENCH_DIR="${bench_name//\//_}"
+
+    # 任务目录：logs/<date>/<model>/[<benchmark>][__<TASK_ID>]
+    # 带 benchmark 时每个 benchmark 独立目录 -> 同一模型跑多个 benchmark 不打架
+    # TASK_ID 用于同一天同一个 benchmark 跑多个任务的场景（挂载同一个目录时消歧）
+    if [ -n "$BENCH_DIR" ]; then
+        local sub="$BENCH_DIR"
+        [ -n "${TASK_ID:-}" ] && sub="${sub}__${TASK_ID//\//_}"
+        TASK_LOG_DIR="${BASE_LOG_DIR}/${DATE_STR}/${MODEL_DIR}/${sub}"
+    else
+        TASK_LOG_DIR="${BASE_LOG_DIR}/${DATE_STR}/${MODEL_DIR}"
+    fi
+
     PID_FILE="${TASK_LOG_DIR}/vllm.pids"
     NGINX_PID="${TASK_LOG_DIR}/nginx.pid"
     NGINX_CONF="${TASK_LOG_DIR}/nginx.conf"
@@ -60,8 +74,20 @@ set_task_paths() {
     NGINX_ACCESS_LOG="${TASK_LOG_DIR}/nginx_access.log"
 }
 
+# 把 <BASE_LOG_DIR>/<date>/<model>[/<benchmark>] 拆成三段
+parse_task_rel() {
+    local rel="${1#$BASE_LOG_DIR/}"
+    local d="" m="" b=""
+    IFS='/' read -r d m b <<< "$rel"
+    echo "$d $m $b"
+}
+
 latest_task_dir() {
     [ -d "$BASE_LOG_DIR" ] || return 1
+    # 优先带 benchmark 的任务目录（深度 3），没有再退回旧结构（深度 2）
+    local d
+    d=$(find "$BASE_LOG_DIR" -mindepth 3 -maxdepth 3 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
+    [ -n "$d" ] && { echo "$d"; return 0; }
     find "$BASE_LOG_DIR" -mindepth 2 -maxdepth 2 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-
 }
 
@@ -273,6 +299,7 @@ do_start() {
     local TP_SIZE="${3:-2}"
     local DATE_STR_ARG="${4:-$DEFAULT_DATE_STR}"
     local MAX_MODEL_LEN="${5:-${MAX_MODEL_LEN:-131072}}"
+    local BENCHMARK_ARG="${6:-${BENCHMARK:-}}"
     local BASE_PORT="${VLLM_BASE_PORT:-8000}"
 
     [ -z "$MODEL_PATH" ] && { log_err "缺少 model_path"; exit 1; }
@@ -282,7 +309,7 @@ do_start() {
         exit 1
     fi
 
-    set_task_paths "$DATE_STR_ARG" "$MODEL_NAME"
+    set_task_paths "$DATE_STR_ARG" "$MODEL_NAME" "$BENCHMARK_ARG"
 
     # 1) 后端识别
     local BACKEND
@@ -313,8 +340,14 @@ do_start() {
     > "$PID_FILE"
 
     # 3) 基线参数
+    # 注意：local 会遮蔽同名环境变量，所以先取出外部覆盖值再声明
+    local ENV_MAX_NUM_SEQS="${MAX_NUM_SEQS:-}"
+    local ENV_MAX_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-}"
     local GPU_MEM_UTIL MAX_NUM_SEQS MAX_BATCHED_TOKENS EXTRA_CHUNKED_ARGS
     tp_lookup "$TP_SIZE"
+    # benchmark 配置文档可以覆盖这两项（环境变量传入）
+    [ -n "$ENV_MAX_NUM_SEQS" ] && MAX_NUM_SEQS="$ENV_MAX_NUM_SEQS"
+    [ -n "$ENV_MAX_BATCHED_TOKENS" ] && MAX_BATCHED_TOKENS="$ENV_MAX_BATCHED_TOKENS"
     GPU_MEM_UTIL=$(backend_memory_util "$BACKEND" "$TP_SIZE")
 
     local DTYPE
@@ -459,6 +492,7 @@ do_nginx() {
     local listen_port="${1:-1358}"
     local model_arg="${2:-}"
     local date_arg="${3:-}"
+    local bench_arg="${4:-${BENCHMARK:-}}"
     local template_file="${SCRIPT_DIR}/nginx_vllm.conf.template"
 
     if ! command -v nginx >/dev/null 2>&1; then
@@ -476,12 +510,15 @@ do_nginx() {
     fi
 
     if [ -n "$model_arg" ]; then
-        set_task_paths "${date_arg:-$DEFAULT_DATE_STR}" "$model_arg"
+        set_task_paths "${date_arg:-$DEFAULT_DATE_STR}" "$model_arg" "$bench_arg"
     else
         local task_dir
         task_dir=$(latest_task_dir) || { log_err "未找到任务，请先执行 start 或指定 model_name"; exit 1; }
-        set_task_paths "$(basename "$(dirname "$task_dir")")" "$(basename "$task_dir")"
-        log_info "自动识别任务: ${DATE_STR}/${MODEL_DIR}"
+        local parts d m b
+        parts=$(parse_task_rel "$task_dir")
+        read -r d m b <<< "$parts"
+        set_task_paths "$d" "$m" "$b"
+        log_info "自动识别任务: ${DATE_STR}/${MODEL_DIR}${BENCH_DIR:+/${BENCH_DIR}}"
     fi
 
     mkdir -p "$TASK_LOG_DIR"
@@ -511,8 +548,10 @@ do_nginx() {
         -e "s|{{LISTEN_PORT}}|${listen_port}|g" \
         "$template_file" > "$NGINX_CONF"
 
+    # 临时文件必须和目标同目录：mktemp 默认在 /tmp，跨设备 mv 会报
+    # "preserving permissions ... Operation not permitted"，而且不是原子替换。
     local tmp_conf
-    tmp_conf=$(mktemp)
+    tmp_conf=$(mktemp "${NGINX_CONF}.tmp.XXXXXX")
     awk -v servers="$upstream_servers" '
         /\{\{UPSTREAM_SERVERS\}\}/ { printf "%s", servers; next }
         { print }
@@ -599,23 +638,40 @@ do_status() {
     if [ "$#" -gt 0 ]; then
         local MODEL_NAME="$1"
         local DATE_STR_ARG="${2:-$DEFAULT_DATE_STR}"
-        set_task_paths "$DATE_STR_ARG" "$MODEL_NAME"
+        local BENCH_ARG="${3:-${BENCHMARK:-}}"
+        set_task_paths "$DATE_STR_ARG" "$MODEL_NAME" "$BENCH_ARG"
         print_task_status
         return 0
     fi
 
     local found=0
-    local dir
+    local dir parts d m b
+    # 优先列出带 benchmark 的任务目录（深度 3）
     while IFS= read -r dir; do
         [ -n "$dir" ] || continue
-        set_task_paths "$(basename "$(dirname "$dir")")" "$(basename "$dir")"
+        parts=$(parse_task_rel "$dir")
+        read -r d m b <<< "$parts"
+        set_task_paths "$d" "$m" "$b"
         print_task_status
         echo ""
         found=1
-    done < <(find "$BASE_LOG_DIR" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort)
+    done < <(find "$BASE_LOG_DIR" -mindepth 3 -maxdepth 3 -type d 2>/dev/null | sort)
+
+    # 没有 benchmark 层的老任务（深度 2）
+    if [ "$found" -eq 0 ]; then
+        while IFS= read -r dir; do
+            [ -n "$dir" ] || continue
+            parts=$(parse_task_rel "$dir")
+            read -r d m b <<< "$parts"
+            set_task_paths "$d" "$m" "$b"
+            print_task_status
+            echo ""
+            found=1
+        done < <(find "$BASE_LOG_DIR" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort)
+    fi
 
     if [ "$found" -eq 0 ]; then
-        echo "未找到任何任务目录: ${BASE_LOG_DIR}/<date_str>/<model_name>"
+        echo "未找到任何任务目录: ${BASE_LOG_DIR}/<date_str>/<model_name>[/<benchmark>]"
     fi
 }
 
@@ -624,9 +680,17 @@ do_status() {
 do_stop() {
     local MODEL_NAME="${1:-}"
     local DATE_STR_ARG="${2:-$DEFAULT_DATE_STR}"
+    local BENCH_ARG="${3:-${BENCHMARK:-}}"
     [ -z "$MODEL_NAME" ] && { log_err "缺少 model_name"; exit 1; }
 
-    set_task_paths "$DATE_STR_ARG" "$MODEL_NAME"
+    set_task_paths "$DATE_STR_ARG" "$MODEL_NAME" "$BENCH_ARG"
+
+    if [ ! -d "$TASK_LOG_DIR" ]; then
+        log_warn "任务目录不存在: $TASK_LOG_DIR"
+        log_warn "该模型下已有的任务目录:"
+        find "${BASE_LOG_DIR}/${DATE_STR}/${MODEL_DIR}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sed 's/^/    /' || true
+        exit 1
+    fi
 
     echo "任务目录: ${TASK_LOG_DIR}"
 
@@ -705,12 +769,14 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         *)
             echo "用法: bash $0 {start|nginx|status|stop}"
             echo ""
-            echo "  start  <model_path> <model_name> <tp_size> [date_str] [max_model_len]"
-            echo "  nginx  [listen_port] [model_name] [date_str]   # 缺省自动识别最近启动的任务"
-            echo "  status [model_name] [date_str]   # 缺省显示所有任务"
-            echo "  stop   <model_name> [date_str]"
+            echo "  start  <model_path> <model_name> <tp_size> [date_str] [max_model_len] [benchmark]"
+            echo "  nginx  [listen_port] [model_name] [date_str] [benchmark]"
+            echo "  status [model_name] [date_str] [benchmark]   # 缺省显示所有任务"
+            echo "  stop   <model_name> [date_str] [benchmark]"
             echo ""
-            echo "  date_str 默认 ${DEFAULT_DATE_STR}，运行状态存放于 logs/<date_str>/<model_name>/"
+            echo "  date_str 默认 ${DEFAULT_DATE_STR}"
+            echo "  benchmark 可选；指定后任务目录为 logs/<date_str>/<model_name>/<benchmark>/"
+            echo "  TASK_ID 可选；指定后追加 __<TASK_ID>，用于同 benchmark 多任务并发（挂载同一目录时消歧）"
             exit 1
             ;;
     esac
