@@ -15,20 +15,38 @@ http {
                            '$status $upstream_addr $request_time $upstream_response_time';
 
     upstream vllm_backend {
+        # zone：让所有 worker 进程共享同一份 upstream 状态和连接计数。
+        # 不写 zone 的话每个 worker 各算各的，worker_processes auto 越多倾斜越严重
+        # （实测 4 个 vLLM 实例：8000 被灌到 max_num_seqs 满载，其余只有 70~90）。
+        zone vllm_backend 64k;
+
         # least_conn：将请求发到当前活跃连接最少的实例，避免单机批量推理流量倾斜
         least_conn;
 
 {{UPSTREAM_SERVERS}}
 
-        keepalive 128;
+        # nginx -> vLLM 的连接复用数。客户端并发 512 时 nginx 要同时向
+        # upstream 发 512 个请求，keepalive 只有 128 的话另外 384 个每次都要
+        # 新建连接 -> 大量 connect 堆积，间接把客户端的建连也拖慢。
+        keepalive 1024;
         keepalive_requests 10000;
         keepalive_timeout 60s;
     }
 
     server {
-        listen {{LISTEN_PORT}} reuseport;
+        # 不用 reuseport：它让内核按连接四元组把连接散到各 worker，
+        # 和 upstream 的 zone 共享计数配合时反而容易倾斜。
+        # backlog 要够大：客户端并发 512 时，每条流式请求占一条连接，
+        # 重试还要不断新建连接，瞬时上千条连接同时要建。
+        # nginx 默认 backlog=511，SYN 队列一满内核就丢 SYN，
+        # 客户端 TCP 握手重传（1s/2s/4s…），超过 connect timeout 就 ConnectTimeout。
+        # 实测：并发 512 时 200+ 次 ConnectTimeout，backlog 511 是直接原因。
+        listen {{LISTEN_PORT}} backlog=8192;
         server_name localhost;
-        access_log {{NGINX_ACCESS_LOG}} vllm_format buffer=32k flush=5s;
+        # 不加 buffer：nginx 退出时缓冲区里没刷的记录会丢，
+        # 任务跑完就 stop nginx 的话，最慢的那批请求（正是要排查的）根本查不到。
+        # access_log 的量级只有几千条，每条直接落盘的开销可以忽略。
+        access_log {{NGINX_ACCESS_LOG}} vllm_format;
 
         location / {
             proxy_pass http://vllm_backend;
@@ -44,8 +62,12 @@ http {
             proxy_next_upstream_tries 2;
             proxy_next_upstream_timeout 30s;
 
-            proxy_read_timeout 1800s;
-            proxy_send_timeout 1800s;
+            # 这两个只是「兜底上限」，真正的超时由客户端按 max_tokens 推算
+            # （见 vllm_infer.py 的 auto_read_timeout）。
+            # 必须放宽：nginx 先掐断的话客户端收到的是截断流而不是可重试的超时，
+            # 白白浪费一次服务端 slot。
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
             proxy_connect_timeout 30s;
 
             proxy_set_header Host $host;

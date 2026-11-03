@@ -17,11 +17,11 @@
 ├── run_pipeline.sh              # 任务入口：启动服务 + 执行推理
 ├── nginx_vllm.conf.template     # Nginx 配置模板
 ├── .gitignore                   # 忽略运行时产物
-├── configs/benchmarks.json      # benchmark 配置文档（各数据集的专属参数）
+├── configs/benchmarks.json      # benchmark 配置文档（输入文件 + 客户端参数）
 ├── datasets/                    # 输入目录（*.jsonl）
 ├── output/                      # 输出目录
-├── tools/conf2sh.py             # 读取 benchmark 配置（bash <-> JSON 桥）
-└── logs/<date>/<model>/<bench>/  # 每个任务独立的运行状态与日志
+├── tools/check_run.py           # 任务健康检查
+└── logs/<date>/<model>/         # 每个任务独立的运行状态与日志
 ```
 
 ## 环境要求
@@ -208,7 +208,6 @@ bash run_pipeline.sh
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--input` | `<项目>/datasets` | 输入 jsonl **文件**路径（推荐） |
-| `--input_dir` | — | **[已弃用]** 输入目录，扫描其中的 `*.jsonl`。请改用 `--input` |
 | `--output_dir` | `<项目>/output` | 输出目录 |
 | `--host` | `http://localhost:1358/v1` | OpenAI 兼容接口 base_url |
 | `--model` | 必填 | 模型名 |
@@ -242,8 +241,7 @@ datasets/
 
 客户端收到的是**具体文件路径**，直接读，不扫描目录。
 
-> 旧的目录扫描模式（`--input_dir`，会把目录下所有 `*.jsonl` 都跑一遍）已弃用，
-> 仍能跑但会打 `[Deprecate]` 提示。
+> 客户端只接受具体文件路径，**不再支持目录扫描**。
 
 ### 输出
 
@@ -332,8 +330,8 @@ curl --noproxy '*' http://localhost:1358/v1/chat/completions \
 
 ## Benchmark 模式（多数据集顺序跑）
 
-每个 benchmark 的参数（`max_model_len`、数据集位置、解码参数等）集中在
-**`configs/benchmarks.json`**。新增 benchmark 只需要加一节配置，**不用改任何代码**。
+每个 benchmark 的**输入文件和客户端参数**集中在 **`configs/benchmarks.json`**。
+新增 benchmark 只需要加一节配置，**不用改任何代码**。
 
 ```bash
 export MODEL_PATH=/root/private_data/models/Qwen/Qwen3.5-4B
@@ -349,42 +347,112 @@ bash run_pipeline.sh --benchmarks gpqa,gsm8k_zh
 执行流程：
 
 ```
-for 每个 benchmark:
-    读配置 -> 需要换服务端参数? 停旧服务 + 起新服务 : 复用现有服务
-    -> 跑该 benchmark 的数据集
+起一次服务（max_model_len 由命令行给，默认 32768）
+    -> vllm_infer.py 自己读配置，逐个 benchmark 跑
 ```
 
-- **服务端参数指纹相同**（`max_model_len` / `max_num_seqs` / `max_num_batched_tokens` 一致）
-  → **复用同一个服务实例，不重启**，省掉一次模型加载
-- 参数不同 → 停掉旧实例、起新实例（端口复用）
-- 任务日志按 benchmark 分层：`logs/<date>/<model>/<benchmark>/`
-- 每个 benchmark 的产出独立：`output/<benchmark>/`
+- **服务端参数**不在配置里：`max_model_len` 在 `run_pipeline.sh` 手动传，
+  其余性能参数固化在 `start_server.sh`（依据见 `docs/性能调优结论.md`）
+- **输出目录**在 `run_pipeline.sh` 手动传，默认 `output/<日期>/<模型名>`（两级）
+- **客户端参数**（`max_tokens` / `temperature` / `system_prompt` 等）在配置的
+  `client` 段里改；命令行显式传的优先于配置
+
+配置长这样：
+
+```json
+{
+  "gpqa": {
+    "dataset": { "input_file": "./datasets/gpqa.jsonl" },
+    "client": {
+      "max_tokens": 4096,
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "presence_penalty": 0.0,
+      "system_prompt": null
+    }
+  }
+}
+```
+- **服务只起一次**，客户端按顺序逐个 benchmark 跑推理
+- 任务日志：`logs/<date>/<model>/<--benchmarks 的原始值>/`
+  （比如 `--benchmarks gpqa,gsm8k_zh` → `logs/<date>/<model>/gpqa,gsm8k_zh/`）
+  第三层用原始值不拆开：`nginx.pid` / `nginx.conf` / `nginx_access.log`
+  这些文件名全一样，按原始值建目录，不同任务之间才不会互相覆盖
+- 产出：`output/<date>/<模型名>/<benchmark名>_output.txt`
 
 ### 配置文档格式
 
 ```json
 {
   "gpqa": {
-    "dataset": { "input_file": "./datasets/gpqa.jsonl", "output_dir": "./output/gpqa" },
-    "server":  { "max_model_len": 8192, "max_num_seqs": 64,
-                 "max_num_batched_tokens": 32768 },
+    "dataset": { "input_file": "./datasets/gpqa.jsonl" },
     "client":  { "max_tokens": 4096, "temperature": 0.0, "top_p": 1.0,
-                 "system_prompt_file": null }
+                 "system_prompt": null }
   }
 }
 ```
 
 | 段 | 说明 |
 | --- | --- |
-| `dataset.input_file` | 该 benchmark **唯一**的数据集 jsonl 路径（直接读这个文件，不扫描目录） |
-| `dataset.output_dir` | 产出目录 |
-| `server` | vLLM 服务端启动参数，**同时用于判断能否复用服务实例** |
-| `client` | `vllm_infer.py` 的命令行参数名（去掉 `--`），直接透传 |
-| `client.system_prompt_file` | 特殊键：文件路径，内容会作为 `--system_prompt` 传入 |
+| `dataset.input_file` | 该 benchmark **唯一**的数据集 jsonl 路径（相对仓库根，直接读这个文件，不扫描目录） |
+| `client` | `vllm_infer.py` 的参数默认值。命令行显式传的优先于这里的值 |
+| `client.system_prompt` | 统一系统提示词，直接写字符串，不用单独存文件 |
+
+**服务端参数不在配置里**：`max_model_len` 在 `run_pipeline.sh` 手动传（默认 32768），
+其余性能参数固化在 `start_server.sh`。
+
+### 长输出场景（max_tokens 很大）
+
+`max_tokens` 很大时（比如 16384），单请求耗时 = 排队 + 生成，很容易超过客户端和 nginx 的固定超时。
+**读超时已按 `max_tokens` 自动推算**，不用手改：
+
+```
+read_timeout = max(1800, max_tokens ÷ 8 tok/s/req × 5)
+```
+
+（8 tok/s/req 是 910B4 + 4B 模型满负载的保守实测值，×5 留排队余量）
+
+| max_tokens | 自动 read_timeout |
+| --- | --- |
+| 1024 | 1800s（保持原值）|
+| 4096 | 2560s |
+| 16384 | 10240s |
+
+要手动指定就在 client 段写 `"read_timeout": <秒>`；nginx 侧的 `proxy_read_timeout` 留作宽松兜底（86400s）。
+
+**客户端的流式落盘**：每条完成立刻追加写进 `<输出名>_output.jsonl.tmp`，
+任务中断也不丢已完成的结果；下次带 `--resume` 会优先从这个 tmp 恢复。
+跑完自动合并成正式的 `_output.jsonl`（按原始顺序）和 `_output.txt`，并删除 tmp。
+
+### 服务端性能参数在哪改
+
+**不在配置里，在 `start_server.sh` 的「固定的服务端参数」区块**：
+
+```bash
+COMPILATION_CONFIG='{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+export VLLM_DISABLE_COMPILE_CACHE=1
+```
+
+`max_num_seqs` / `max_num_batched_tokens` 按 TP 自动选档（`set_server_params()`）。
+
+这些值全部来自 910B4 实测并已固化，**不要做成可调项**，也不要挪进 benchmark 配置 ——
+避免后面有人乱调、每个环境的参数还不一样。实测依据见 `docs/性能调优结论.md`。
+
+### 客户端并发 A/B
+
+`bench.py` 量客户端并发对吞吐的影响（服务端参数固定）：
+
+```bash
+python3 bench.py --input datasets/gsm8k_zh.jsonl --host http://localhost:1358/v1 \
+    --model Qwen3.5-4B --concurrency 64,128,256,512
+```
+
+**只看 `[System] 系统吞吐`**，不要看 `avg_tps`（那是单请求速率的平均，并发越高它必然越低）。
 
 ### 并发消歧
 
-同一天、同一模型、同一 benchmark 跑多个任务时，用 `TASK_ID` 区分目录：
+同一天、同一模型跑多个任务时，用 `TASK_ID` 区分目录：
 
 ```bash
 export TASK_ID=jobA
@@ -394,16 +462,23 @@ bash run_pipeline.sh --benchmarks gpqa
 
 ### 命令行参数
 
+`run_pipeline.sh` 的参数：
+
 | 参数 | 说明 |
 | --- | --- |
+| `output_dir`（位置参数，可省） | 结果输出目录，默认 `output/<日期>/<模型名>` |
+| `max_model_len`（位置参数，可省） | 服务端 `max_model_len`，默认 `32768` |
 | `--benchmarks <a,b,c>` | 按顺序跑哪些 benchmark |
-| `--conf <file>` | 配置文件路径，默认 `configs/benchmarks.json` |
+| `--input <file>` | 单文件模式（不走配置） |
+| `--benchmark_conf <file>` | 配置文件路径，默认 `configs/benchmarks.json` |
 | 其余参数 | 原样透传给 `vllm_infer.py` |
 
-查看配置里有哪些 benchmark：
-
 ```bash
-python3 tools/conf2sh.py configs/benchmarks.json --list
+# 常规：输出到默认目录，max_model_len 用默认 32768
+bash run_pipeline.sh --benchmarks gpqa,gsm8k_zh
+
+# 指定输出目录和 max_model_len
+bash run_pipeline.sh /data/results 16384 --benchmarks gpqa
 ```
 
 ### 失败会明确报出来（不会「假成功」）
@@ -421,6 +496,7 @@ python3 tools/conf2sh.py configs/benchmarks.json --list
 > ⚠️ 升级客户端时务必把 `vllm_infer.py` 一起换掉。旧版只有 `--input_dir`，
 > 而 `--input` 是 `--input_dir` 的前缀，argparse 会把 `--input` **静默绑到**
 > `--input_dir` 上，表现为「找不到文件」但退出码 0。新版会提前检测并拦下。
+> 新版客户端已彻底移除 `--input_dir`，传了会直接报错（而不是静默扫目录）。
 
 ## 注意事项
 

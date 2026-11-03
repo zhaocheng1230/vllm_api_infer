@@ -20,7 +20,7 @@ export TP_SIZE=1
 export CONCURRENCY=64
 export STOP_AFTER=1
 
-bash run_pipeline.sh
+bash run_pipeline.sh --benchmarks gpqa,gsm8k_zh
 
 curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \

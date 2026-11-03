@@ -39,6 +39,18 @@ DEFAULT_BACKEND="${DEVICE_BACKEND:-auto}"
 # 单个实例启动等待时间（秒）；冷启动加载大模型可能超过 5 分钟
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-900}"
 
+# ========================== 固定的服务端参数 ==========================
+# 全部来自 910B4 + Qwen3.5-4B 实测，固化在这里。
+# 不要做成可调项，也不要挪到 benchmark 配置里 —— 实测依据见 docs/性能调优结论.md
+#
+#   FULL_DECODE_ONLY   吞吐 +1.2%、TTFT p95 −34%、e2e p95 −6.5%
+#   max_num_seqs=128   2 卡实测峰值并发 256 = 2 实例 × 128
+#   关闭编译缓存       Qwen3.5 的 GDN 门控 layernorm 是 Triton kernel，
+#                      编译产物不可跨进程序列化，换进程加载必崩
+#                      （vLLM 已知问题：它的编译器缓存并不总是完全正确）
+COMPILATION_CONFIG='{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+export VLLM_DISABLE_COMPILE_CACHE=1
+
 # ========================== 工具函数 ==========================
 
 log_info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
@@ -57,11 +69,16 @@ set_task_paths() {
     BENCH_DIR="${bench_name//\//_}"
 
     # 任务目录：logs/<date>/<model>/[<benchmark>][__<TASK_ID>]
-    # 带 benchmark 时每个 benchmark 独立目录 -> 同一模型跑多个 benchmark 不打架
-    # TASK_ID 用于同一天同一个 benchmark 跑多个任务的场景（挂载同一个目录时消歧）
-    if [ -n "$BENCH_DIR" ]; then
-        local sub="$BENCH_DIR"
-        [ -n "${TASK_ID:-}" ] && sub="${sub}__${TASK_ID//\//_}"
+    # 第三层是 benchmark 名（单文件模式用输入文件名）。
+    # 必须分这一层：nginx.pid / nginx.conf / nginx_access.log / vllm_*.log
+    # 这些文件名全都一样，放同一个目录里互相覆盖，根本分不清是哪个任务的。
+    # TASK_ID 用于「同一个 benchmark 跑多次」的消歧。
+    local sub=""
+    [ -n "$BENCH_DIR" ] && sub="$BENCH_DIR"
+    if [ -n "${TASK_ID:-}" ]; then
+        sub="${sub:+${sub}__}${TASK_ID//\//_}"
+    fi
+    if [ -n "$sub" ]; then
         TASK_LOG_DIR="${BASE_LOG_DIR}/${DATE_STR}/${MODEL_DIR}/${sub}"
     else
         TASK_LOG_DIR="${BASE_LOG_DIR}/${DATE_STR}/${MODEL_DIR}"
@@ -257,12 +274,15 @@ backend_memory_util() {
         return
     fi
 
+    # 显存利用率按 TP 收窄：
+    # max_num_batched_tokens 从 16384 提到 32768 后，batch buffer 占用翻倍，
+    # 显存利用率必须相应降下来，否则容易 OOM（启动阶段就起不来）。
     case "$tp" in
-        1) echo 0.92 ;;
-        2) echo 0.95 ;;
-        4) echo 0.93 ;;
-        8) echo 0.90 ;;
-        *) echo 0.95 ;;
+        1) echo 0.85 ;;
+        2) echo 0.85 ;;
+        4) echo 0.82 ;;
+        8) echo 0.80 ;;
+        *) echo 0.80 ;;
     esac
 }
 
@@ -279,15 +299,41 @@ backend_dtype() {
     fi
 }
 
-# --- 基线参数查表（按 TP 档位） ---
-tp_lookup() {
-    local tp=$1
-    case $tp in
-        1) MAX_NUM_SEQS=128; MAX_BATCHED_TOKENS=32768; EXTRA_CHUNKED_ARGS="" ;;
-        2) MAX_NUM_SEQS=128; MAX_BATCHED_TOKENS=16384; EXTRA_CHUNKED_ARGS="--max-num-partial-prefills 1" ;;
-        4) MAX_NUM_SEQS=96;  MAX_BATCHED_TOKENS=32768; EXTRA_CHUNKED_ARGS="--max-num-partial-prefills 1" ;;
-        8) MAX_NUM_SEQS=64;  MAX_BATCHED_TOKENS=65536; EXTRA_CHUNKED_ARGS="--max-num-partial-prefills 1" ;;
-        *) MAX_NUM_SEQS=128; MAX_BATCHED_TOKENS=16384; EXTRA_CHUNKED_ARGS="" ;;
+# --- 服务端档位（按 TP 自动选，不是给人调的开关）---
+# TP=1 是实测配置（2 卡 → 2 实例 → 峰值并发 256）。
+# TP>1 单实例吃更多显存，序列数相应收、partial prefill 关掉。
+#
+# TP=2 的 max_num_seqs 从 128 提到 256 的依据（2026-11-02 实测，4 实例 / 8 卡）：
+#   并发 256 -> 每实例 64  = max_num_seqs 的 50% -> 有余量，TTFT p50 11.8s
+#   并发 512 -> 每实例 128 = max_num_seqs 的 100% -> 打满，新请求排队，
+#                                     TTFT p50 升到 89.6s、端到端 p50 237s->403s
+#   而实测 KV cache 峰值只有 22~32% -> 显存根本不是限制，限制的是这个数。
+#   提到 256 后并发 512 时每实例占 50%，排队消失。
+#
+# max_num_batched_tokens 试过 32768，结论是**负收益，已退回 16384**（2026-11-03 实测）：
+#   16384: 墙钟 1413s | 平均吞吐 2730 | 峰值/实例 2000 | TTFT p50 90.6s
+#   32768: 墙钟 1515s | 平均吞吐 2564 | 峰值/实例 2430 | TTFT p50 93.6s
+#   峰值涨了 21% 但平均吞吐跌了 6%、墙钟长了 7%、TTFT 一点没降 ——
+#   batched_tokens 越大，prefill 越能抢 decode 的算力（vLLM 经典现象）。
+#
+# TTFT ~90 秒的本质是「prefill 总量 ÷ prefill 吞吐」，与 batched_tokens 无关：
+#   每实例 128 个请求 × ~2000 prompt token = 256K token prefill
+#   ÷ ~3000 tok/s/实例 ≈ 85 秒 ✓
+# 要降 TTFT 只有三条路：降并发 / prefix caching / 缩短 prompt。
+set_server_params() {
+    # 档位依据（910B4 32GB 实测）：
+    #   TP=1 实测：2 卡 2 实例，并发 256 是吞吐拐点（2061 tok/s），512 掉头
+    #   TP=2 实测：8 卡 4 实例，并发 256 最优（TTFT p50 11.8s / 端到端 p50 237s）
+    #
+    # 客户端并发的取法：**每实例 64 个**（TP=1 因为 batched_tokens 更大，可以到 128）
+    #   每实例只占 max_num_seqs 的 50% -> 新请求能立刻进来，不会排队
+    #   （并发占满 max_num_seqs 时 TTFT 会从 11.8s 飙到 90s）
+    case "$1" in
+        1) MAX_NUM_SEQS=128; MAX_NUM_BATCHED_TOKENS=32768; TP_EXTRA_ARGS=() ;;
+        2) MAX_NUM_SEQS=256; MAX_NUM_BATCHED_TOKENS=16384; TP_EXTRA_ARGS=(--max-num-partial-prefills 1) ;;
+        4) MAX_NUM_SEQS=128; MAX_NUM_BATCHED_TOKENS=32768; TP_EXTRA_ARGS=(--max-num-partial-prefills 1) ;;
+        8) MAX_NUM_SEQS=128; MAX_NUM_BATCHED_TOKENS=65536; TP_EXTRA_ARGS=(--max-num-partial-prefills 1) ;;
+        *) MAX_NUM_SEQS=128; MAX_NUM_BATCHED_TOKENS=16384; TP_EXTRA_ARGS=() ;;
     esac
 }
 
@@ -298,7 +344,7 @@ do_start() {
     local MODEL_NAME="${2:-}"
     local TP_SIZE="${3:-2}"
     local DATE_STR_ARG="${4:-$DEFAULT_DATE_STR}"
-    local MAX_MODEL_LEN="${5:-${MAX_MODEL_LEN:-131072}}"
+    local MAX_MODEL_LEN="${5:-${MAX_MODEL_LEN:-32768}}"
     local BENCHMARK_ARG="${6:-${BENCHMARK:-}}"
     local BASE_PORT="${VLLM_BASE_PORT:-8000}"
 
@@ -320,6 +366,11 @@ do_start() {
     local -a DEVICE_IDS=()
     device_ids_for_backend "$BACKEND"
 
+    # 每实例推荐的客户端并发（实测：每实例占 max_num_seqs 的 50% 时不排队，
+    # 占满时 TTFT 从 11.8s 飙到 90s）。TP=1 的 batched_tokens 更大，可以到 128。
+    local RECOMMENDED_CONCURRENCY_PER_INSTANCE=64
+    [ "$TP_SIZE" = "1" ] && RECOMMENDED_CONCURRENCY_PER_INSTANCE=128
+
     local LOOP_COUNT=$((DEVICE_TOTAL / TP_SIZE))
     [ "$LOOP_COUNT" -le 0 ] && { log_err "设备不足: total=$DEVICE_TOTAL, per_model=$TP_SIZE"; exit 1; }
 
@@ -339,32 +390,27 @@ do_start() {
     fi
     > "$PID_FILE"
 
-    # 3) 基线参数
-    # 注意：local 会遮蔽同名环境变量，所以先取出外部覆盖值再声明
-    local ENV_MAX_NUM_SEQS="${MAX_NUM_SEQS:-}"
-    local ENV_MAX_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-}"
-    local GPU_MEM_UTIL MAX_NUM_SEQS MAX_BATCHED_TOKENS EXTRA_CHUNKED_ARGS
-    tp_lookup "$TP_SIZE"
-    # benchmark 配置文档可以覆盖这两项（环境变量传入）
-    [ -n "$ENV_MAX_NUM_SEQS" ] && MAX_NUM_SEQS="$ENV_MAX_NUM_SEQS"
-    [ -n "$ENV_MAX_BATCHED_TOKENS" ] && MAX_BATCHED_TOKENS="$ENV_MAX_BATCHED_TOKENS"
+    # 3) 服务端参数（固定值 + 按 TP 自动选档，不接受外部覆盖）
+    local GPU_MEM_UTIL MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS
+    local -a TP_EXTRA_ARGS=()
+    set_server_params "$TP_SIZE"
     GPU_MEM_UTIL=$(backend_memory_util "$BACKEND" "$TP_SIZE")
 
     local DTYPE
     DTYPE=$(backend_dtype "$BACKEND")
 
     # 4) 模型特殊参数
-    local EXTRA_VLLM_ARGS=""
+    #    注意：--language-model-only 不能关。实测（910B4 + Qwen3.5-4B）关掉后
+    #    吞吐掉 31%、e2e p95 涨 217%，见 docs/性能调优结论.md
     local TOOL_CALL_PARSER="hermes"
+    local -a MODEL_EXTRA_ARGS=()
 
     if echo "$MODEL_NAME" | grep -iqE "Qwen3[._][5-9]"; then
-        log_info "检测到 Qwen3.5+ 模型，启用 language_model_only + qwen3_coder parser"
         TOOL_CALL_PARSER="qwen3_coder"
-        EXTRA_VLLM_ARGS="--language-model-only"
+        MODEL_EXTRA_ARGS=(--language-model-only)
     elif echo "$MODEL_NAME" | grep -iqE "MiniCPM5|minicpm5"; then
-        log_info "检测到 MiniCPM5 模型，使用 minicpm5 tool parser"
         TOOL_CALL_PARSER="minicpm5"
-        EXTRA_VLLM_ARGS="--tool-parser-plugin ${MINICPM5_PLUGIN:-/path/to/MiniCPM/tool_parsers/minicpm5xml_tool_parser.py}"
+        MODEL_EXTRA_ARGS=(--tool-call-parser-plugin "${MINICPM5_PLUGIN:-/path/to/MiniCPM/tool_parsers/minicpm5xml_tool_parser.py}")
     fi
 
     local TIMESTAMP
@@ -372,30 +418,18 @@ do_start() {
     local started_ports=()
 
     echo "========================================="
-    echo "  模型路径:       $MODEL_PATH"
-    echo "  模型名称:       $MODEL_NAME"
-    echo "  任务日期:       $DATE_STR"
-    echo "  任务目录:       $TASK_LOG_DIR"
-    echo "  设备后端:       $BACKEND"
-    echo "  设备总数:       $DEVICE_TOTAL"
-    echo "  设备列表:       $(IFS=,; echo "${DEVICE_IDS[*]:0:$DEVICE_TOTAL}")"
-    echo "  每模型卡数:     $TP_SIZE"
-    echo "  实例数量:       $LOOP_COUNT"
-    echo "  端口范围:       $BASE_PORT ~ $((BASE_PORT + LOOP_COUNT - 1))"
-    echo "  显存利用率:     $GPU_MEM_UTIL"
-    echo "  dtype:          $DTYPE"
-    echo "  max-num-seqs:   $MAX_NUM_SEQS"
-    echo "  batched-tokens: $MAX_BATCHED_TOKENS"
-    echo "  extra-chunked:  ${EXTRA_CHUNKED_ARGS:-(none)}"
-    echo "  建议客户端并发: $((LOOP_COUNT * MAX_NUM_SEQS))"
-    echo "  --- 参数建议 ---"
-    echo "  CONCURRENCY 依次试 $((LOOP_COUNT * MAX_NUM_SEQS / 4)) / $((LOOP_COUNT * MAX_NUM_SEQS / 2)) / $((LOOP_COUNT * MAX_NUM_SEQS))，用 bench.py 逐档比"
-    if [ "$MAX_BATCHED_TOKENS" -lt "$MAX_MODEL_LEN" ]; then
-        echo "  注意: max-num-batched-tokens($MAX_BATCHED_TOKENS) < MAX_MODEL_LEN($MAX_MODEL_LEN)"
-        echo "        保持 chunked prefill 开启；若手动关闭，vLLM 启动即报错"
-    fi
-    echo "  注意: --async-scheduling 提吞吐但会拉高 TTFT，吞吐和 TTFT 一起看"
-    echo "  编译缓存: ${VLLM_CACHE_BASE:-$HOME/.cache/vllm_multi}/<模型>/<端口>  （每实例独立，避免多实例并发写冲突）"
+    echo "  模型:       $MODEL_NAME  ($MODEL_PATH)"
+    echo "  任务目录:   $TASK_LOG_DIR"
+    echo "  后端:       $BACKEND   设备 $DEVICE_TOTAL 张   每模型 $TP_SIZE 卡   实例 $LOOP_COUNT 个"
+    echo "  设备列表:   $(IFS=,; echo "${DEVICE_IDS[*]:0:$DEVICE_TOTAL}")"
+    echo "  端口:       $BASE_PORT ~ $((BASE_PORT + LOOP_COUNT - 1))"
+    echo "  服务端:     max-model-len=$MAX_MODEL_LEN   max-num-seqs=$MAX_NUM_SEQS   batched-tokens=$MAX_NUM_BATCHED_TOKENS"
+    echo "  显存/dtype: $GPU_MEM_UTIL / $DTYPE"
+    # 服务端总容量（所有实例的 max_num_seqs 之和）只是理论上限，
+    # 不是建议的客户端并发。实测：并发占满总容量时 TTFT 会从 11.8s 飙到 90s。
+    echo "  并发建议:   $((LOOP_COUNT * RECOMMENDED_CONCURRENCY_PER_INSTANCE))"
+    echo "             （每实例 $RECOMMENDED_CONCURRENCY_PER_INSTANCE 个；"
+    echo "              服务端总容量 $((LOOP_COUNT * MAX_NUM_SEQS))，不建议占满）"
     echo "========================================="
 
     for i in $(seq 0 $((LOOP_COUNT - 1))); do
@@ -414,35 +448,60 @@ do_start() {
         echo "正在启动任务 $i: 设备 [${CURRENT_DEVICES}], 端口 [${CURRENT_PORT}], 日志 [${LOG_FILE}]..."
         echo "  编译缓存: ${VLLM_CACHE_BASE:-$HOME/.cache/vllm_multi}/${MODEL_DIR}/${CURRENT_PORT}"
 
+        # vllm serve 的完整命令行。
+        # 固定参数直接写死；只有「按 TP / 按模型变化」的少数几项走 SERVE_OPT，
+        # 最后一次性追加 —— 空参数会让 argparse 直接报 "unrecognized arguments: " 拒绝启动。
+        local -a SERVE_CMD=(
+            vllm serve "${MODEL_PATH}"
+            --host 0.0.0.0
+            --port "${CURRENT_PORT}"
+            --served-model-name "${MODEL_NAME}"
+            --tensor-parallel-size "${TP_SIZE}"
+            --dtype "${DTYPE}"
+            --gpu-memory-utilization "${GPU_MEM_UTIL}"
+            --max-model-len "${MAX_MODEL_LEN}"
+            --max-num-seqs "${MAX_NUM_SEQS}"
+            --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
+            --trust-remote-code
+            --async-scheduling
+            --enable-auto-tool-choice
+            --tool-call-parser "${TOOL_CALL_PARSER}"
+            # 不开 prefix caching：
+            # 实测 vLLM 0.23.0 + vllm-ascend 默认就是 enable_prefix_caching=False。
+            # 我们的场景是单轮批量推理，没有多轮对话那种大段公共上下文；
+            # 共享前缀只有 chat template + system_prompt（约 50~75 token），
+            # 而每条请求 prefill 约 2000 token —— 收益不到 1%，
+            # 却要付 prefix caching 的记账开销，还有混合 Mamba 模型的支持风险。
+            # 如果将来是多轮对话（公共上下文几千 token），再打开才有意义。
+        )
+        local -a SERVE_OPT=()
+        if [ ${#MODEL_EXTRA_ARGS[@]} -gt 0 ]; then
+            SERVE_OPT+=("${MODEL_EXTRA_ARGS[@]}")
+        fi
+        if [ ${#TP_EXTRA_ARGS[@]} -gt 0 ]; then
+            SERVE_OPT+=("${TP_EXTRA_ARGS[@]}")
+        fi
+        if [ ${#SERVE_OPT[@]} -gt 0 ]; then
+            SERVE_CMD+=("${SERVE_OPT[@]}")
+        fi
+        SERVE_CMD+=(--compilation-config "${COMPILATION_CONFIG}")
+        # 打印完整命令行：vLLM 有些参数会被静默忽略，日志里一搜就知道传没传进去
+        echo "  serve 命令: ${SERVE_CMD[*]}"
+
         # 在子 shell 中设置设备相关环境变量，exec 后 PID 即为 vllm 进程
         (
             export_backend_env "$BACKEND" "$CURRENT_DEVICES"
 
             # 每个实例用独立的编译缓存目录。
             # vLLM 的缓存路径是 <VLLM_CACHE_ROOT>/torch_compile_cache/<hash>/rank_{rank}_{dp_rank}，
-            # 多实例同模型同配置时 rank 都是 0_0 -> 写同一个文件。
-            # 冷启动时多实例并发编译同一个 kernel 会互相覆盖，导致
-            # "Compiling model again due to a load failure" 警告并多花几十秒重编。
+            # 多实例同模型同配置时 rank 都是 0_0 -> 会写同一个文件。
+            # 注：vLLM 自己的编译缓存已全局关闭（见文件头），这里只是隔离
+            # torch.compile / Triton 自己的缓存目录，避免多实例并发写冲突。
             export VLLM_CACHE_ROOT="${VLLM_CACHE_BASE:-$HOME/.cache/vllm_multi}/${MODEL_DIR}/${CURRENT_PORT}"
             export TRITON_CACHE_DIR="${VLLM_CACHE_ROOT}/triton"
             mkdir -p "${VLLM_CACHE_ROOT}"
 
-            exec vllm serve "${MODEL_PATH}" \
-                --host 0.0.0.0 \
-                --port "${CURRENT_PORT}" \
-                --served-model-name "${MODEL_NAME}" \
-                --tensor-parallel-size "${TP_SIZE}" \
-                --dtype "${DTYPE}" \
-                --gpu-memory-utilization "${GPU_MEM_UTIL}" \
-                --max-model-len "${MAX_MODEL_LEN}" \
-                --max-num-seqs "${MAX_NUM_SEQS}" \
-                --max-num-batched-tokens "${MAX_BATCHED_TOKENS}" \
-                ${EXTRA_CHUNKED_ARGS} \
-                --trust-remote-code \
-                --async-scheduling \
-                --enable-auto-tool-choice \
-                --tool-call-parser "${TOOL_CALL_PARSER}" \
-                ${EXTRA_VLLM_ARGS} \
+            exec "${SERVE_CMD[@]}" \
                 > "${LOG_FILE}" 2>&1
         ) &
 
